@@ -1,0 +1,8 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = """
+Lets the webview resize the window between its expanded and collapsed sizes,
+and ask for it to be re-parked in its corner.
+"""
+permissions = ["allow-set-collapsed", "allow-snap"]

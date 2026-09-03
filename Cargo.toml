@@ -1,0 +1,25 @@
+[package]
+name = "tauri-plugin-corner-snap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Parks a Tauri window in a screen corner and keeps it there across drags, resizes and display changes"
+license = "MIT"
+repository = ""
+links = "tauri-plugin-corner-snap"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+tauri = "2"
+log = "0.4"
+
+# Used to observe display changes, which Tauri does not report. Kept in step
+# with the version Tauri itself pulls in, so the window handle types match.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
