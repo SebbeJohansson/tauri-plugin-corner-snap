@@ -24,14 +24,7 @@ pub struct Watcher {
 }
 
 impl Watcher {
-  /// Reports that the window moved. Timing is the watcher's business.
-  pub fn nudge(&self) {
-    let _ = self.moves.send(());
-  }
-
   /// A sender other reporters (window events, display messages) can keep.
-  /// Only the Windows display watcher wants one today.
-  #[cfg_attr(not(windows), allow(dead_code))]
   pub fn sender(&self) -> Sender<()> {
     self.moves.clone()
   }

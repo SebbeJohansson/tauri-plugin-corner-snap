@@ -98,14 +98,6 @@ pub(crate) fn apply_state<R: Runtime>(
 
   let logical = LogicalSize::new(state.size.0, state.size.1);
 
-  // While minimized the window reports a sentinel position, so the anchor it
-  // looks to occupy is meaningless and would move it to the wrong corner on
-  // restore. Sizing still works: it sets the size the window restores to.
-  if window.is_minimized().unwrap_or(false) {
-    log::debug!("corner-snap: window is minimized; sizing without moving");
-    return window.set_size(logical).map_err(|error| error.to_string());
-  }
-
   let Some(monitor) = pick_monitor(window) else {
     log::warn!("corner-snap: no monitor reported; resizing without moving");
     return window.set_size(logical).map_err(|error| error.to_string());
@@ -180,6 +172,8 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
     Err(error) => log::warn!("corner-snap: no window handle for {label}: {error}"),
   }
 
+  let watcher_sender = watcher.sender();
+
   shared
     .0
     .watchers
@@ -187,16 +181,17 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
     .expect("corner-snap watcher registry is not poisoned")
     .insert(label.clone(), watcher);
 
+  // The sender is captured directly rather than looked up in the registry.
+  // This callback runs on the window's own thread, on every move, and taking a
+  // mutex there is a good way to stall the message loop that has to keep
+  // pumping for anything else to work. A channel send cannot block.
+  let moves = watcher_sender;
   let hooked = shared.clone();
   let hooked_window = window.clone();
   window.on_window_event(move |event| match event {
     WindowEvent::Moved(_) => {
       // The watcher owns the timing; this only reports that a move happened.
-      if let Ok(watchers) = hooked.0.watchers.lock() {
-        if let Some(watcher) = watchers.get(hooked_window.label()) {
-          watcher.nudge();
-        }
-      }
+      let _ = moves.send(());
     }
     WindowEvent::Destroyed => detach(&hooked_window, &hooked),
     _ => {}
