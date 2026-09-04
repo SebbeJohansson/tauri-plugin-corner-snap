@@ -98,6 +98,14 @@ pub(crate) fn apply_state<R: Runtime>(
 
   let logical = LogicalSize::new(state.size.0, state.size.1);
 
+  // While minimized the window reports a sentinel position, so the anchor it
+  // looks to occupy is meaningless and would move it to the wrong corner on
+  // restore. Sizing still works: it sets the size the window restores to.
+  if window.is_minimized().unwrap_or(false) {
+    log::debug!("corner-snap: window is minimized; sizing without moving");
+    return window.set_size(logical).map_err(|error| error.to_string());
+  }
+
   let Some(monitor) = pick_monitor(window) else {
     log::warn!("corner-snap: no monitor reported; resizing without moving");
     return window.set_size(logical).map_err(|error| error.to_string());

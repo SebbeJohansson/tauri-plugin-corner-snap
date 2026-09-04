@@ -27,5 +27,6 @@ pub(crate) fn snap<R: Runtime>(
   window: Window<R>,
   shared: State<'_, Shared>,
 ) -> Result<(), String> {
-  snap_to_nearest_anchor(&window, shared.config().edge_margin).map_err(|error| error.to_string())
+  snap_to_nearest_anchor(&window, shared.config().edge_margin, &mut None)
+    .map_err(|error| error.to_string())
 }

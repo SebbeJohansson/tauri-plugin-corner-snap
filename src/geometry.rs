@@ -101,10 +101,27 @@ pub fn occupied_anchor<R: Runtime>(
 }
 
 /// Moves the window to whichever corner it now sits closest to.
+///
+/// `last_attempt` remembers the (position, target) pair of the previous move so
+/// a window that cannot be moved is not chased forever; pass `&mut None` for a
+/// one-off request that should always try.
 pub fn snap_to_nearest_anchor<R: Runtime>(
   window: &Window<R>,
   edge_margin: i32,
+  last_attempt: &mut Option<(PhysicalPosition<i32>, PhysicalPosition<i32>)>,
 ) -> tauri::Result<()> {
+  // A minimized window sits at a sentinel position far off every screen, and
+  // `set_position` on it changes only where it will restore to, never what it
+  // reports now. So the "already parked" check below can never be satisfied,
+  // and every move we make raises another move event: the window is chased at
+  // full speed, the message loop stops being serviced, and Windows replaces it
+  // with a "Not Responding" ghost. Restoring raises its own move event, which
+  // is when placement picks up again.
+  if window.is_minimized().unwrap_or(false) {
+    log::debug!("corner-snap: window is minimized; leaving it alone");
+    return Ok(());
+  }
+
   let Some(monitor) = pick_monitor(window) else {
     // Logged quietly: the placement check runs on a timer, and under WSLg this
     // is the normal answer every time.
@@ -113,15 +130,29 @@ pub fn snap_to_nearest_anchor<R: Runtime>(
   };
 
   let size = window.outer_size()?;
-  let corner = occupied_anchor(window, &monitor, size)?;
-  let target = anchor_position(&monitor, size, corner, edge_margin);
+  let anchor = occupied_anchor(window, &monitor, size)?;
+  let target = anchor_position(&monitor, size, anchor, edge_margin);
   let position = window.outer_position()?;
 
   // Setting the position raises another move event. Stopping here when the
   // window is already parked keeps that from looping.
-  if position.x == target.x && position.y == target.y {
+  if position == target {
+    *last_attempt = None;
     return Ok(());
   }
 
+  // The same move, from the same place, as last time: it did not take, so the
+  // window is somewhere it cannot be moved from. Backstop for anything that
+  // pins a window the way minimizing does; without it the retry raises another
+  // move event and nothing ever breaks the cycle.
+  if *last_attempt == Some((position, target)) {
+    log::warn!(
+      "corner-snap: window would not move from {position:?} to {target:?}; \
+       leaving it until something else changes"
+    );
+    return Ok(());
+  }
+
+  *last_attempt = Some((position, target));
   window.set_position(target)
 }

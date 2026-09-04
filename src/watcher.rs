@@ -59,11 +59,15 @@ pub fn spawn<R: Runtime>(
 
   let label = window.label().to_string();
   thread::spawn(move || {
+    // Carried across iterations so a window that refuses to move is noticed
+    // once rather than chased on every event.
+    let mut last_attempt = None;
+
     while receiver.recv().is_ok() {
       // Swallow the rest of the stream until the window has been still.
       while receiver.recv_timeout(snap_delay).is_ok() {}
 
-      if let Err(error) = snap_to_nearest_anchor(&window, edge_margin) {
+      if let Err(error) = snap_to_nearest_anchor(&window, edge_margin, &mut last_attempt) {
         log::error!("corner-snap: could not snap {label}: {error}");
       }
     }
