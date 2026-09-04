@@ -17,7 +17,16 @@ pub(crate) fn set_state<R: Runtime>(
   shared: State<'_, Shared>,
   state: String,
 ) -> Result<(), String> {
-  apply_state(&window, shared.config(), &state, None)
+  // Logged on the way in and out at info level, because "did the webview's
+  // request reach Rust at all" is otherwise invisible: a rejected invoke
+  // surfaces only in the webview console, not in the terminal.
+  log::info!("corner-snap: set_state({state:?}) on {}", window.label());
+  let result = apply_state(&window, shared.config(), &state, None);
+  match &result {
+    Ok(()) => log::info!("corner-snap: set_state({state:?}) done"),
+    Err(error) => log::error!("corner-snap: set_state({state:?}) failed: {error}"),
+  }
+  result
 }
 
 /// Re-parks the window against its nearest anchor, without waiting for the
