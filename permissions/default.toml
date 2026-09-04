@@ -2,7 +2,7 @@
 
 [default]
 description = """
-Lets the webview resize the window between its expanded and collapsed sizes,
-and ask for it to be re-parked in its corner.
+Lets the webview move the window between its configured states, and ask for
+it to be re-parked against its anchor.
 """
-permissions = ["allow-set-collapsed", "allow-snap"]
+permissions = ["allow-set-state", "allow-snap"]

@@ -2,32 +2,33 @@
 
 use tauri::{Monitor, PhysicalPosition, PhysicalSize, Runtime, Window};
 
-/// A corner of the monitor's work area.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Corner {
+/// A corner of the monitor's work area to hold a window against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Anchor {
   TopLeft,
   TopRight,
   BottomLeft,
   BottomRight,
 }
 
-impl Corner {
+impl Anchor {
   /// (towards the right edge, towards the bottom edge).
   pub fn flags(self) -> (bool, bool) {
     match self {
-      Corner::TopLeft => (false, false),
-      Corner::TopRight => (true, false),
-      Corner::BottomLeft => (false, true),
-      Corner::BottomRight => (true, true),
+      Anchor::TopLeft => (false, false),
+      Anchor::TopRight => (true, false),
+      Anchor::BottomLeft => (false, true),
+      Anchor::BottomRight => (true, true),
     }
   }
 
   pub fn from_flags(right: bool, bottom: bool) -> Self {
     match (right, bottom) {
-      (false, false) => Corner::TopLeft,
-      (true, false) => Corner::TopRight,
-      (false, true) => Corner::BottomLeft,
-      (true, true) => Corner::BottomRight,
+      (false, false) => Anchor::TopLeft,
+      (true, false) => Anchor::TopRight,
+      (false, true) => Anchor::BottomLeft,
+      (true, true) => Anchor::BottomRight,
     }
   }
 }
@@ -51,10 +52,10 @@ pub fn pick_monitor<R: Runtime>(window: &Window<R>) -> Option<Monitor> {
 
 /// Position that puts a window of `size` in one corner of the monitor's work
 /// area, which is the screen minus the taskbar.
-pub fn corner_position(
+pub fn anchor_position(
   monitor: &Monitor,
   size: PhysicalSize<u32>,
-  corner: Corner,
+  corner: Anchor,
   edge_margin: i32,
 ) -> PhysicalPosition<i32> {
   let (right, bottom) = corner.flags();
@@ -76,15 +77,15 @@ pub fn corner_position(
   PhysicalPosition::new(x, y)
 }
 
-/// Which corner of `monitor` a window of `size` currently sits in.
+/// Which anchor of `monitor` a window of `size` currently sits at.
 ///
 /// Centres are compared rather than edges, so the corner the window mostly
 /// occupies wins even when it hangs off the side of the screen.
-pub fn occupied_corner<R: Runtime>(
+pub fn occupied_anchor<R: Runtime>(
   window: &Window<R>,
   monitor: &Monitor,
   size: PhysicalSize<u32>,
-) -> tauri::Result<Corner> {
+) -> tauri::Result<Anchor> {
   let area = monitor.work_area();
   let position = window.outer_position()?;
 
@@ -93,14 +94,14 @@ pub fn occupied_corner<R: Runtime>(
   let area_centre_x = area.position.x + area.size.width as i32 / 2;
   let area_centre_y = area.position.y + area.size.height as i32 / 2;
 
-  Ok(Corner::from_flags(
+  Ok(Anchor::from_flags(
     window_centre_x >= area_centre_x,
     window_centre_y >= area_centre_y,
   ))
 }
 
 /// Moves the window to whichever corner it now sits closest to.
-pub fn snap_to_nearest_corner<R: Runtime>(
+pub fn snap_to_nearest_anchor<R: Runtime>(
   window: &Window<R>,
   edge_margin: i32,
 ) -> tauri::Result<()> {
@@ -112,8 +113,8 @@ pub fn snap_to_nearest_corner<R: Runtime>(
   };
 
   let size = window.outer_size()?;
-  let corner = occupied_corner(window, &monitor, size)?;
-  let target = corner_position(&monitor, size, corner, edge_margin);
+  let corner = occupied_anchor(window, &monitor, size)?;
+  let target = anchor_position(&monitor, size, corner, edge_margin);
   let position = window.outer_position()?;
 
   // Setting the position raises another move event. Stopping here when the

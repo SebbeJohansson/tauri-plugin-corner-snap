@@ -1,130 +1,133 @@
 //! Keeps a Tauri window parked in a corner of the screen.
 //!
 //! The window can be dragged anywhere; when the drag stops it slides back to
-//! whichever corner it was dropped nearest. It re-parks itself when it is
-//! resized between its expanded and collapsed sizes, when the work area changes
-//! (the taskbar moving, for instance), and when a monitor is plugged in or
-//! pulled out.
+//! whichever corner it was dropped nearest. It re-parks itself when it changes
+//! between named states, when the work area changes (the taskbar moving, for
+//! instance), and when a monitor is plugged in or pulled out.
 //!
-//! ```no_run
-//! tauri::Builder::default()
-//!   .plugin(tauri_plugin_corner_snap::init(tauri_plugin_corner_snap::Config {
-//!     expanded: (260.0, 90.0),
-//!     collapsed: (44.0, 44.0),
-//!     manage: tauri_plugin_corner_snap::Manage::Labels(vec!["main".into()]),
-//!     initial_corner: Some(tauri_plugin_corner_snap::Corner::BottomRight),
-//!     ..Default::default()
-//!   }))
-//!   .setup(|app| {
-//!     // The plugin has already placed the window, so showing it here does not
-//!     // flash at the default position.
-//!     use tauri::Manager;
-//!     app.get_webview_window("main").unwrap().show()?;
-//!     Ok(())
-//!   });
+//! # Configuring it in `tauri.conf.json`
+//!
+//! Nothing but `.plugin(tauri_plugin_corner_snap::init())` is needed in Rust:
+//!
+//! ```json
+//! {
+//!   "plugins": {
+//!     "corner-snap": {
+//!       "states": {
+//!         "expanded": { "size": [260, 90] },
+//!         "collapsed": { "size": [44, 44] }
+//!       },
+//!       "initialState": "expanded",
+//!       "initialAnchor": "bottomRight",
+//!       "manage": { "labels": ["main"] }
+//!     }
+//!   }
+//! }
 //! ```
+//!
+//! # Configuring it in Rust
+//!
+//! [`init_with`] takes the same settings as a value and ignores the JSON.
 
 mod commands;
+mod config;
 mod geometry;
 mod watcher;
 
 #[cfg(windows)]
 mod display_watch;
 
-pub use geometry::Corner;
+pub use config::{Config, Manage, WindowState};
+pub use geometry::Anchor;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::plugin::{Builder, TauriPlugin};
-use tauri::{Manager, Runtime, Window, WindowEvent};
+use tauri::{LogicalSize, Manager, PhysicalSize, Runtime, Window, WindowEvent};
 
-use geometry::{corner_position, pick_monitor};
+use geometry::{anchor_position, occupied_anchor, pick_monitor};
 use watcher::Watcher;
-
-/// Which windows the plugin takes charge of.
-#[derive(Clone, Debug)]
-pub enum Manage {
-  /// Every window the app opens.
-  All,
-  /// Only the windows with these labels.
-  Labels(Vec<String>),
-}
-
-impl Manage {
-  fn covers(&self, label: &str) -> bool {
-    match self {
-      Manage::All => true,
-      Manage::Labels(labels) => labels.iter().any(|candidate| candidate == label),
-    }
-  }
-}
-
-/// How the plugin behaves. Build one with `..Default::default()` and override
-/// what matters; the sizes almost always do.
-#[derive(Clone, Debug)]
-pub struct Config {
-  /// Gap between the window and the edge of the work area, in physical pixels.
-  pub edge_margin: i32,
-  /// Window size with the panel showing, in logical pixels.
-  pub expanded: (f64, f64),
-  /// Window size when collapsed to its badge, in logical pixels.
-  pub collapsed: (f64, f64),
-  /// How long the window must sit still before it is treated as dropped.
-  ///
-  /// Dragging is handled by the operating system, which reports a stream of
-  /// moves but no "drag finished" event, so the end of the drag is inferred
-  /// from the window going quiet.
-  pub snap_delay: Duration,
-  /// How often the window's placement is re-checked.
-  ///
-  /// On Windows the display messages do the real work, so this is a backstop
-  /// for anything they miss, and the only mechanism on other platforms. It is
-  /// slow on purpose: a window at dead coordinates is rare, and re-checking
-  /// often would mean fighting anything else that legitimately moves the
-  /// window.
-  pub placement_check: Duration,
-  /// Which windows to manage.
-  pub manage: Manage,
-  /// Where to park the window the moment it is created. `None` leaves it
-  /// wherever the window builder put it until something moves it.
-  pub initial_corner: Option<Corner>,
-}
-
-impl Default for Config {
-  fn default() -> Self {
-    Self {
-      edge_margin: 16,
-      // Placeholders. A widget's real sizes belong in the consuming app.
-      expanded: (320.0, 120.0),
-      collapsed: (48.0, 48.0),
-      snap_delay: Duration::from_millis(250),
-      placement_check: Duration::from_secs(10),
-      manage: Manage::All,
-      initial_corner: None,
-    }
-  }
-}
 
 /// Plugin state, shared between the window hooks and the commands.
 ///
 /// Held behind an `Arc` so `init` can hand a clone to the window hook without
-/// depending on the managed state being in place: the hook and `setup` run in
-/// an order the plugin does not control.
+/// depending on the managed state being in place. The config arrives later than
+/// the handle does when it comes from `tauri.conf.json`, which is why it sits
+/// behind a `OnceLock` rather than being a plain field.
 #[derive(Clone)]
 pub(crate) struct Shared(Arc<Inner>);
 
 pub(crate) struct Inner {
-  config: Config,
+  config: OnceLock<Config>,
   /// One entry per managed window. Removing an entry stops its threads.
   watchers: Mutex<HashMap<String, Watcher>>,
 }
 
 impl Shared {
-  pub(crate) fn config(&self) -> &Config {
-    &self.0.config
+  fn new() -> Self {
+    Shared(Arc::new(Inner {
+      config: OnceLock::new(),
+      watchers: Mutex::new(HashMap::new()),
+    }))
   }
+
+  /// The config, or the defaults if setup somehow has not run yet. Defaults
+  /// configure no states, so the worst case is a window nothing resizes.
+  pub(crate) fn config(&self) -> &Config {
+    self.0.config.get_or_init(Config::default)
+  }
+}
+
+/// Resizes the window to a named state and puts it back against an anchor.
+///
+/// Shared by the `set_state` command and the initial placement, so a window
+/// opens in exactly the shape a later `set_state` would give it.
+pub(crate) fn apply_state<R: Runtime>(
+  window: &Window<R>,
+  config: &Config,
+  name: &str,
+  anchor_override: Option<Anchor>,
+) -> Result<(), String> {
+  let state = config.states.get(name).ok_or_else(|| {
+    format!(
+      "unknown window state '{name}'; configured states: {}",
+      config.state_names()
+    )
+  })?;
+
+  let logical = LogicalSize::new(state.size.0, state.size.1);
+
+  let Some(monitor) = pick_monitor(window) else {
+    log::warn!("corner-snap: no monitor reported; resizing without moving");
+    return window.set_size(logical).map_err(|error| error.to_string());
+  };
+
+  // The anchor is resolved before the resize. Measured afterwards, a window
+  // that grew in a corner overhangs the screen edge, and its centre can land on
+  // the neighbouring monitor, which would send it to that screen instead.
+  let anchor = match anchor_override.or(state.anchor) {
+    Some(anchor) => anchor,
+    None => {
+      let size_before = window.outer_size().map_err(|error| error.to_string())?;
+      occupied_anchor(window, &monitor, size_before).map_err(|error| error.to_string())?
+    }
+  };
+
+  let scale = window.scale_factor().map_err(|error| error.to_string())?;
+  let size_after: PhysicalSize<u32> = logical.to_physical(scale);
+
+  // Moving before resizing means the window grows into place, rather than
+  // briefly spilling past the edge of the screen.
+  window
+    .set_position(anchor_position(
+      &monitor,
+      size_after,
+      anchor,
+      config.edge_margin,
+    ))
+    .map_err(|error| error.to_string())?;
+  window.set_size(logical).map_err(|error| error.to_string())
 }
 
 /// Starts managing `window`: places it, watches it, and cleans up after it.
@@ -136,21 +139,11 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
     return;
   }
 
-  // Done before the watcher starts, so the first move event the watcher sees is
-  // a real one rather than this placement.
-  if let Some(corner) = config.initial_corner {
-    match (pick_monitor(&window), window.outer_size()) {
-      (Some(monitor), Ok(size)) => {
-        let target = corner_position(&monitor, size, corner, config.edge_margin);
-        if let Err(error) = window.set_position(target) {
-          log::error!("corner-snap: could not place {label}: {error}");
-        }
-      }
-      (None, _) => log::warn!(
-        "corner-snap: no monitor reported; leaving {label} at its default position. \
-         WSLg does not expose monitors, so display-dependent behaviour needs a real desktop."
-      ),
-      (_, Err(error)) => log::error!("corner-snap: could not measure {label}: {error}"),
+  // Done before the watcher starts, so the first move the watcher sees is a
+  // real one rather than this placement.
+  if let Some(state) = &config.initial_state {
+    if let Err(error) = apply_state(&window, config, state, config.initial_anchor) {
+      log::error!("corner-snap: could not place {label}: {error}");
     }
   }
 
@@ -216,24 +209,52 @@ fn detach<R: Runtime>(window: &Window<R>, shared: &Shared) {
   }
 }
 
-/// Builds the plugin.
-pub fn init<R: Runtime>(config: Config) -> TauriPlugin<R> {
-  let shared = Shared(Arc::new(Inner {
-    config,
-    watchers: Mutex::new(HashMap::new()),
-  }));
+/// Complains about anything that will only show up later as a command failing.
+fn warn_about(config: &Config) {
+  if config.states.is_empty() {
+    log::warn!("corner-snap: no states configured; set_state will reject every name");
+  }
+  if let Some(state) = &config.initial_state {
+    if !config.states.contains_key(state) {
+      log::error!(
+        "corner-snap: initialState '{state}' is not one of: {}",
+        config.state_names()
+      );
+    }
+  }
+}
 
+fn build<R: Runtime>(shared: Shared) -> TauriPlugin<R, Option<Config>> {
   let for_setup = shared.clone();
 
-  Builder::<R>::new("corner-snap")
-    .invoke_handler(tauri::generate_handler![
-      commands::set_collapsed,
-      commands::snap
-    ])
-    .setup(move |app, _api| {
-      app.manage(for_setup);
+  Builder::<R, Option<Config>>::new("corner-snap")
+    .invoke_handler(tauri::generate_handler![commands::set_state, commands::snap])
+    .setup(move |app, api| {
+      // A config passed to `init_with` is already in place, so this only has an
+      // effect for `init`. An absent `plugins.corner-snap` arrives as null,
+      // which is why the config type is an `Option`.
+      for_setup
+        .0
+        .config
+        .get_or_init(|| api.config().clone().unwrap_or_default());
+      warn_about(for_setup.config());
+      app.manage(for_setup.clone());
       Ok(())
     })
     .on_window_ready(move |window| attach(window, shared.clone()))
     .build()
+}
+
+/// Builds the plugin, reading its settings from `plugins.corner-snap` in
+/// `tauri.conf.json`. Missing settings fall back to [`Config::default`].
+pub fn init<R: Runtime>() -> TauriPlugin<R, Option<Config>> {
+  build(Shared::new())
+}
+
+/// Builds the plugin with settings supplied from Rust, ignoring whatever
+/// `tauri.conf.json` says.
+pub fn init_with<R: Runtime>(config: Config) -> TauriPlugin<R, Option<Config>> {
+  let shared = Shared::new();
+  let _ = shared.0.config.set(config);
+  build(shared)
 }

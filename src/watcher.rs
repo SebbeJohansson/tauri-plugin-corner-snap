@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tauri::{Runtime, Window};
 
-use crate::geometry::snap_to_nearest_corner;
+use crate::geometry::snap_to_nearest_anchor;
 
 /// Everything holding a managed window's threads open.
 ///
@@ -63,7 +63,7 @@ pub fn spawn<R: Runtime>(
       // Swallow the rest of the stream until the window has been still.
       while receiver.recv_timeout(snap_delay).is_ok() {}
 
-      if let Err(error) = snap_to_nearest_corner(&window, edge_margin) {
+      if let Err(error) = snap_to_nearest_anchor(&window, edge_margin) {
         log::error!("corner-snap: could not snap {label}: {error}");
       }
     }
