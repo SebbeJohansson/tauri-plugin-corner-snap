@@ -98,16 +98,11 @@ pub(crate) fn apply_state<R: Runtime>(
 
   let logical = LogicalSize::new(state.size.0, state.size.1);
 
-  // Every window call below is traced. Each one crosses into the window's own
-  // thread, and when one of them fails to come back the last line logged is
-  // the only thing that says which. Cheap, and only on an explicit request.
-  log::debug!("corner-snap: apply_state({name}) -> pick_monitor");
   let Some(monitor) = pick_monitor(window) else {
     log::warn!("corner-snap: no monitor reported; resizing without moving");
     return window.set_size(logical).map_err(|error| error.to_string());
   };
 
-  log::debug!("corner-snap: apply_state({name}) -> outer_size");
   let size_before = window.outer_size().map_err(|error| error.to_string())?;
 
   // The anchor is resolved before the resize. Measured afterwards, a window
@@ -116,12 +111,10 @@ pub(crate) fn apply_state<R: Runtime>(
   let anchor = match anchor_override.or(state.anchor) {
     Some(anchor) => anchor,
     None => {
-      log::debug!("corner-snap: apply_state({name}) -> outer_position");
       occupied_anchor(window, &monitor, size_before).map_err(|error| error.to_string())?
     }
   };
 
-  log::debug!("corner-snap: apply_state({name}) -> scale_factor");
   let scale = window.scale_factor().map_err(|error| error.to_string())?;
   let size_after: PhysicalSize<u32> = logical.to_physical(scale);
   let target = anchor_position(&monitor, size_after, anchor, config.edge_margin);
@@ -140,20 +133,22 @@ pub(crate) fn apply_state<R: Runtime>(
   let shrinking =
     size_after.width <= size_before.width && size_after.height <= size_before.height;
 
-  let result = if shrinking {
-    log::debug!("corner-snap: apply_state({name}) shrinking -> set_size({logical:?})");
+  log::debug!(
+    "corner-snap: {name} -> {}x{} at {},{} ({})",
+    size_after.width,
+    size_after.height,
+    target.x,
+    target.y,
+    if shrinking { "size then move" } else { "move then size" }
+  );
+
+  if shrinking {
     window.set_size(logical).map_err(|error| error.to_string())?;
-    log::debug!("corner-snap: apply_state({name}) shrinking -> set_position({target:?})");
     window.set_position(target).map_err(|error| error.to_string())
   } else {
-    log::debug!("corner-snap: apply_state({name}) growing -> set_position({target:?})");
     window.set_position(target).map_err(|error| error.to_string())?;
-    log::debug!("corner-snap: apply_state({name}) growing -> set_size({logical:?})");
     window.set_size(logical).map_err(|error| error.to_string())
-  };
-
-  log::debug!("corner-snap: apply_state({name}) -> returned");
-  result
+  }
 }
 
 /// Starts managing `window`: places it, watches it, and cleans up after it.

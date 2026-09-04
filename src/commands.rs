@@ -28,8 +28,6 @@ pub(crate) fn set_state<R: Runtime>(
     ));
   }
 
-  log::info!("corner-snap: set_state({state:?}) on {}", window.label());
-
   // Moving the work to a thread is the point here, not an optimisation.
   //
   // A synchronous command runs on the main thread, inside the webview's IPC
@@ -44,9 +42,10 @@ pub(crate) fn set_state<R: Runtime>(
   // Off the main thread the same calls take the other branch of Tauri's
   // `send_user_message`: posted to the event loop and run between callbacks,
   // which is where resizing a window is safe.
-  std::thread::spawn(move || match apply_state(&window, &config, &state, None) {
-    Ok(()) => log::info!("corner-snap: set_state({state:?}) done"),
-    Err(error) => log::error!("corner-snap: set_state({state:?}) failed: {error}"),
+  std::thread::spawn(move || {
+    if let Err(error) = apply_state(&window, &config, &state, None) {
+      log::error!("corner-snap: set_state({state:?}) failed: {error}");
+    }
   });
 
   Ok(())
