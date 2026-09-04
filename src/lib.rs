@@ -98,6 +98,10 @@ pub(crate) fn apply_state<R: Runtime>(
 
   let logical = LogicalSize::new(state.size.0, state.size.1);
 
+  // Every window call below is traced. Each one crosses into the window's own
+  // thread, and when one of them fails to come back the last line logged is
+  // the only thing that says which. Cheap, and only on an explicit request.
+  log::debug!("corner-snap: apply_state({name}) -> pick_monitor");
   let Some(monitor) = pick_monitor(window) else {
     log::warn!("corner-snap: no monitor reported; resizing without moving");
     return window.set_size(logical).map_err(|error| error.to_string());
@@ -109,25 +113,28 @@ pub(crate) fn apply_state<R: Runtime>(
   let anchor = match anchor_override.or(state.anchor) {
     Some(anchor) => anchor,
     None => {
+      log::debug!("corner-snap: apply_state({name}) -> outer_size");
       let size_before = window.outer_size().map_err(|error| error.to_string())?;
+      log::debug!("corner-snap: apply_state({name}) -> outer_position");
       occupied_anchor(window, &monitor, size_before).map_err(|error| error.to_string())?
     }
   };
 
+  log::debug!("corner-snap: apply_state({name}) -> scale_factor");
   let scale = window.scale_factor().map_err(|error| error.to_string())?;
   let size_after: PhysicalSize<u32> = logical.to_physical(scale);
+  let target = anchor_position(&monitor, size_after, anchor, config.edge_margin);
 
   // Moving before resizing means the window grows into place, rather than
   // briefly spilling past the edge of the screen.
+  log::debug!("corner-snap: apply_state({name}) -> set_position({target:?})");
   window
-    .set_position(anchor_position(
-      &monitor,
-      size_after,
-      anchor,
-      config.edge_margin,
-    ))
+    .set_position(target)
     .map_err(|error| error.to_string())?;
-  window.set_size(logical).map_err(|error| error.to_string())
+  log::debug!("corner-snap: apply_state({name}) -> set_size({logical:?})");
+  let result = window.set_size(logical).map_err(|error| error.to_string());
+  log::debug!("corner-snap: apply_state({name}) -> returned");
+  result
 }
 
 /// Starts managing `window`: places it, watches it, and cleans up after it.
@@ -157,19 +164,38 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
   // Unplugging a monitor leaves the window at coordinates that exist on no
   // screen, and nothing in this stack reports that. On Windows the operating
   // system's own message says so immediately.
+  //
+  // Queued onto the main thread rather than installed here. This function runs
+  // inside the window builder, so the window is still being put together --
+  // wry has not necessarily finished attaching the WebView2 controller and its
+  // own subclass. Inserting a subclass into that chain mid-construction puts
+  // ours at a different place in the chain than the version this was extracted
+  // from, which installed it after the window was fully built. Queueing runs it
+  // on the same thread, one loop iteration later, when construction is done.
   #[cfg(windows)]
-  match window.hwnd() {
-    Ok(hwnd) => {
-      if display_watch::watch(hwnd, watcher.sender()) {
-        log::info!("corner-snap: watching display changes for {label}");
-      } else {
-        log::warn!(
-          "corner-snap: could not watch display changes for {label}; \
-           relying on the periodic check"
-        );
+  {
+    let subclass_window = window.clone();
+    let subclass_sender = watcher.sender();
+    let subclass_label = label.clone();
+    if let Err(error) = window.app_handle().run_on_main_thread(move || {
+      match subclass_window.hwnd() {
+        Ok(hwnd) => {
+          if display_watch::watch(hwnd, subclass_sender) {
+            log::info!("corner-snap: watching display changes for {subclass_label}");
+          } else {
+            log::warn!(
+              "corner-snap: could not watch display changes for {subclass_label}; \
+               relying on the periodic check"
+            );
+          }
+        }
+        Err(error) => {
+          log::warn!("corner-snap: no window handle for {subclass_label}: {error}")
+        }
       }
+    }) {
+      log::warn!("corner-snap: could not queue the display watcher for {label}: {error}");
     }
-    Err(error) => log::warn!("corner-snap: no window handle for {label}: {error}"),
   }
 
   let watcher_sender = watcher.sender();
