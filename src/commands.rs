@@ -17,25 +17,57 @@ pub(crate) fn set_state<R: Runtime>(
   shared: State<'_, Shared>,
   state: String,
 ) -> Result<(), String> {
-  // Logged on the way in and out at info level, because "did the webview's
-  // request reach Rust at all" is otherwise invisible: a rejected invoke
-  // surfaces only in the webview console, not in the terminal.
+  let config = shared.config().clone();
+
+  // Checked here, on the way in, so an unconfigured name still comes back to
+  // the webview as a rejected promise rather than disappearing into a thread.
+  if !config.states.contains_key(&state) {
+    return Err(format!(
+      "unknown window state '{state}'; configured states: {}",
+      config.state_names()
+    ));
+  }
+
   log::info!("corner-snap: set_state({state:?}) on {}", window.label());
-  let result = apply_state(&window, shared.config(), &state, None);
-  match &result {
+
+  // Moving the work to a thread is the point here, not an optimisation.
+  //
+  // A synchronous command runs on the main thread, inside the webview's IPC
+  // callback, which Windows has already invoked from inside the event loop's
+  // own dispatch. `SetWindowPos` sends `WM_SIZE`, `WM_NCCALCSIZE` and friends
+  // *synchronously* back into the window procedure, so calling it from there
+  // re-enters an event loop that is already mid-cycle. That is what tao reports
+  // as "NewEvents emitted without explicit RedrawEventsCleared", and it hung
+  // the process. Tellingly, a resize to the size the window already had came
+  // back fine: no size change means no WM_SIZE, so nothing re-enters.
+  //
+  // Off the main thread the same calls take the other branch of Tauri's
+  // `send_user_message`: posted to the event loop and run between callbacks,
+  // which is where resizing a window is safe.
+  std::thread::spawn(move || match apply_state(&window, &config, &state, None) {
     Ok(()) => log::info!("corner-snap: set_state({state:?}) done"),
     Err(error) => log::error!("corner-snap: set_state({state:?}) failed: {error}"),
-  }
-  result
+  });
+
+  Ok(())
 }
 
 /// Re-parks the window against its nearest anchor, without waiting for the
 /// periodic check. Useful after the webview changes something that moves it.
+///
+/// Threaded for the same reason as [`set_state`].
 #[tauri::command]
 pub(crate) fn snap<R: Runtime>(
   window: Window<R>,
   shared: State<'_, Shared>,
 ) -> Result<(), String> {
-  snap_to_nearest_anchor(&window, shared.config().edge_margin, &mut None)
-    .map_err(|error| error.to_string())
+  let edge_margin = shared.config().edge_margin;
+
+  std::thread::spawn(move || {
+    if let Err(error) = snap_to_nearest_anchor(&window, edge_margin, &mut None) {
+      log::error!("corner-snap: snap failed: {error}");
+    }
+  });
+
+  Ok(())
 }

@@ -191,31 +191,23 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
   // ours at a different place in the chain than the version this was extracted
   // from, which installed it after the window was fully built. Queueing runs it
   // on the same thread, one loop iteration later, when construction is done.
+  //
+  // Installed inline. run_on_main_thread was tried here and does nothing when
+  // the caller is already the main thread -- it runs the closure immediately --
+  // so it bought no deferral, only the appearance of one.
   #[cfg(windows)]
-  {
-    let subclass_window = window.clone();
-    let subclass_sender = watcher.sender();
-    let subclass_label = label.clone();
-    log::info!("corner-snap: queueing the display watcher for {label}");
-    if let Err(error) = window.app_handle().run_on_main_thread(move || {
-      match subclass_window.hwnd() {
-        Ok(hwnd) => {
-          if display_watch::watch(hwnd, subclass_sender) {
-            log::info!("corner-snap: watching display changes for {subclass_label}");
-          } else {
-            log::warn!(
-              "corner-snap: could not watch display changes for {subclass_label}; \
-               relying on the periodic check"
-            );
-          }
-        }
-        Err(error) => {
-          log::warn!("corner-snap: no window handle for {subclass_label}: {error}")
-        }
+  match window.hwnd() {
+    Ok(hwnd) => {
+      if display_watch::watch(hwnd, watcher.sender()) {
+        log::info!("corner-snap: watching display changes for {label}");
+      } else {
+        log::warn!(
+          "corner-snap: could not watch display changes for {label}; \
+           relying on the periodic check"
+        );
       }
-    }) {
-      log::warn!("corner-snap: could not queue the display watcher for {label}: {error}");
     }
+    Err(error) => log::warn!("corner-snap: no window handle for {label}: {error}"),
   }
 
   let watcher_sender = watcher.sender();
