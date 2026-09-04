@@ -107,14 +107,15 @@ pub(crate) fn apply_state<R: Runtime>(
     return window.set_size(logical).map_err(|error| error.to_string());
   };
 
+  log::debug!("corner-snap: apply_state({name}) -> outer_size");
+  let size_before = window.outer_size().map_err(|error| error.to_string())?;
+
   // The anchor is resolved before the resize. Measured afterwards, a window
   // that grew in a corner overhangs the screen edge, and its centre can land on
   // the neighbouring monitor, which would send it to that screen instead.
   let anchor = match anchor_override.or(state.anchor) {
     Some(anchor) => anchor,
     None => {
-      log::debug!("corner-snap: apply_state({name}) -> outer_size");
-      let size_before = window.outer_size().map_err(|error| error.to_string())?;
       log::debug!("corner-snap: apply_state({name}) -> outer_position");
       occupied_anchor(window, &monitor, size_before).map_err(|error| error.to_string())?
     }
@@ -125,14 +126,32 @@ pub(crate) fn apply_state<R: Runtime>(
   let size_after: PhysicalSize<u32> = logical.to_physical(scale);
   let target = anchor_position(&monitor, size_after, anchor, config.edge_margin);
 
-  // Moving before resizing means the window grows into place, rather than
-  // briefly spilling past the edge of the screen.
-  log::debug!("corner-snap: apply_state({name}) -> set_position({target:?})");
-  window
-    .set_position(target)
-    .map_err(|error| error.to_string())?;
-  log::debug!("corner-snap: apply_state({name}) -> set_size({logical:?})");
-  let result = window.set_size(logical).map_err(|error| error.to_string());
+  // Which of the two happens first decides whether the window ever occupies a
+  // rectangle outside the work area, and it must never do that: moving a
+  // transparent, always-on-top window off the edge of the screen is what took
+  // the process down.
+  //
+  // The target is the corner slot for the *new* size. Moving there first while
+  // the window still has its old size hangs it off the edge by the difference
+  // between the two -- 200px to the right and 30px below, collapsing 260x90 to
+  // 44x44. So the shrink happens first and the move second; growing keeps the
+  // old order, where the small window moves into the larger slot and grows to
+  // fill it. Either way both steps stay inside the work area.
+  let shrinking =
+    size_after.width <= size_before.width && size_after.height <= size_before.height;
+
+  let result = if shrinking {
+    log::debug!("corner-snap: apply_state({name}) shrinking -> set_size({logical:?})");
+    window.set_size(logical).map_err(|error| error.to_string())?;
+    log::debug!("corner-snap: apply_state({name}) shrinking -> set_position({target:?})");
+    window.set_position(target).map_err(|error| error.to_string())
+  } else {
+    log::debug!("corner-snap: apply_state({name}) growing -> set_position({target:?})");
+    window.set_position(target).map_err(|error| error.to_string())?;
+    log::debug!("corner-snap: apply_state({name}) growing -> set_size({logical:?})");
+    window.set_size(logical).map_err(|error| error.to_string())
+  };
+
   log::debug!("corner-snap: apply_state({name}) -> returned");
   result
 }
@@ -177,6 +196,7 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
     let subclass_window = window.clone();
     let subclass_sender = watcher.sender();
     let subclass_label = label.clone();
+    log::info!("corner-snap: queueing the display watcher for {label}");
     if let Err(error) = window.app_handle().run_on_main_thread(move || {
       match subclass_window.hwnd() {
         Ok(hwnd) => {
