@@ -14,7 +14,7 @@ fixed-size windows that should never end up half off the screen.
 
 ```toml
 # src-tauri/Cargo.toml
-tauri-plugin-corner-snap = { git = "https://github.com/…/tauri-plugin-corner-snap" }
+tauri-plugin-corner-snap = { git = "https://github.com/SebbeJohansson/tauri-plugin-corner-snap", tag = "v0.1.0" }
 ```
 
 ```rust
