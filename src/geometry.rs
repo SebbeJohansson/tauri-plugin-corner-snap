@@ -3,7 +3,7 @@
 use tauri::{Monitor, PhysicalPosition, PhysicalSize, Runtime, Window};
 
 /// A corner of the monitor's work area to hold a window against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Anchor {
   TopLeft,
@@ -100,7 +100,13 @@ pub fn occupied_anchor<R: Runtime>(
   ))
 }
 
-/// Moves the window to whichever corner it now sits closest to.
+/// Moves the window to whichever corner it now sits closest to, and reports
+/// the corner it ended up in.
+///
+/// `Ok(None)` means the corner could not be worked out at all -- there is no
+/// monitor to measure against, or the window is minimized -- as opposed to
+/// `Ok(Some(_))`, which is the corner the window occupies whether this call
+/// moved it there or found it already parked.
 ///
 /// `last_attempt` remembers the (position, target) pair of the previous move so
 /// a window that cannot be moved is not chased forever; pass `&mut None` for a
@@ -109,7 +115,7 @@ pub fn snap_to_nearest_anchor<R: Runtime>(
   window: &Window<R>,
   edge_margin: i32,
   last_attempt: &mut Option<(PhysicalPosition<i32>, PhysicalPosition<i32>)>,
-) -> tauri::Result<()> {
+) -> tauri::Result<Option<Anchor>> {
   // A minimized window sits at a sentinel position far off every screen, and
   // `set_position` on it changes only where it will restore to, never what it
   // reports now. So the "already parked" check below can never be satisfied,
@@ -119,14 +125,14 @@ pub fn snap_to_nearest_anchor<R: Runtime>(
   // is when placement picks up again.
   if window.is_minimized().unwrap_or(false) {
     log::debug!("corner-snap: window is minimized; leaving it alone");
-    return Ok(());
+    return Ok(None);
   }
 
   let Some(monitor) = pick_monitor(window) else {
     // Logged quietly: the placement check runs on a timer, and under WSLg this
     // is the normal answer every time.
     log::debug!("corner-snap: no monitor reported; cannot snap");
-    return Ok(());
+    return Ok(None);
   };
 
   let size = window.outer_size()?;
@@ -138,7 +144,7 @@ pub fn snap_to_nearest_anchor<R: Runtime>(
   // window is already parked keeps that from looping.
   if position == target {
     *last_attempt = None;
-    return Ok(());
+    return Ok(Some(anchor));
   }
 
   // The same move, from the same place, as last time: it did not take, so the
@@ -150,9 +156,28 @@ pub fn snap_to_nearest_anchor<R: Runtime>(
       "corner-snap: window would not move from {position:?} to {target:?}; \
        leaving it until something else changes"
     );
-    return Ok(());
+    // Still the corner it occupies, even though it is not the slot in it.
+    return Ok(Some(anchor));
   }
 
   *last_attempt = Some((position, target));
-  window.set_position(target)
+  window.set_position(target)?;
+  Ok(Some(anchor))
+}
+
+/// The corner `window` occupies right now, measured rather than remembered.
+///
+/// `None` when there is nothing to measure against, which under WSLg is the
+/// only answer there is.
+pub fn current_anchor<R: Runtime>(window: &Window<R>) -> Option<Anchor> {
+  // A minimized window reports a sentinel position far off every screen, which
+  // measures as a perfectly confident top-left. Better to say nothing and let
+  // the caller fall back to the corner it was in before it was minimized.
+  if window.is_minimized().unwrap_or(false) {
+    return None;
+  }
+
+  let monitor = pick_monitor(window)?;
+  let size = window.outer_size().ok()?;
+  occupied_anchor(window, &monitor, size).ok()
 }

@@ -12,6 +12,7 @@ use std::time::Duration;
 use tauri::{Runtime, Window};
 
 use crate::geometry::snap_to_nearest_anchor;
+use crate::report::Reporter;
 
 /// Everything holding a managed window's threads open.
 ///
@@ -42,11 +43,15 @@ impl Watcher {
 /// miss, and the only mechanism on other platforms. Keep it slow: a window at
 /// dead coordinates is rare, and re-checking often means fighting anything else
 /// that legitimately moves the window.
+///
+/// `reporter` announces the corner each snap settles on. It ignores repeats, so
+/// the ticker below can run forever without saying anything.
 pub fn spawn<R: Runtime>(
   window: Window<R>,
   edge_margin: i32,
   snap_delay: Duration,
   placement_check: Duration,
+  reporter: Reporter,
 ) -> Watcher {
   let (moves, receiver) = mpsc::channel::<()>();
 
@@ -60,8 +65,12 @@ pub fn spawn<R: Runtime>(
       // Swallow the rest of the stream until the window has been still.
       while receiver.recv_timeout(snap_delay).is_ok() {}
 
-      if let Err(error) = snap_to_nearest_anchor(&window, edge_margin, &mut last_attempt) {
-        log::error!("corner-snap: could not snap {label}: {error}");
+      match snap_to_nearest_anchor(&window, edge_margin, &mut last_attempt) {
+        Ok(Some(anchor)) => reporter.report(&window, anchor),
+        // No monitor to measure against, or the window is minimized. Reporting
+        // nothing is right here: the corner is unknown, not changed.
+        Ok(None) => {}
+        Err(error) => log::error!("corner-snap: could not snap {label}: {error}"),
       }
     }
   });

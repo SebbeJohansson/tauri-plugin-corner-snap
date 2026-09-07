@@ -28,10 +28,31 @@
 //! # Configuring it in Rust
 //!
 //! [`init_with`] takes the same settings as a value and ignores the JSON.
+//!
+//! # Finding out which corner the window is in
+//!
+//! Every time the window settles into a different corner the plugin emits
+//! [`ANCHOR_EVENT`] to that window, carrying an [`AnchorChanged`]:
+//!
+//! ```ts
+//! import { invoke } from '@tauri-apps/api/core'
+//! import { getCurrentWindow } from '@tauri-apps/api/window'
+//!
+//! // The first corner is settled while the window is still being created, so
+//! // ask once on startup; the event covers every change after that.
+//! let corner = await invoke('plugin:corner-snap|current_anchor')
+//! await getCurrentWindow().listen('corner-snap://anchor', ({ payload }) => {
+//!   corner = payload.anchor
+//! })
+//! ```
+//!
+//! Repeats are swallowed, so the periodic placement check does not emit
+//! anything while the window stays put.
 
 mod commands;
 mod config;
 mod geometry;
+mod report;
 mod watcher;
 
 #[cfg(windows)]
@@ -39,6 +60,7 @@ mod display_watch;
 
 pub use config::{Config, Manage, WindowState};
 pub use geometry::Anchor;
+pub use report::{AnchorChanged, ANCHOR_EVENT};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,6 +69,7 @@ use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{LogicalSize, Manager, PhysicalSize, Runtime, Window, WindowEvent};
 
 use geometry::{anchor_position, occupied_anchor, pick_monitor};
+use report::Reporter;
 use watcher::Watcher;
 
 /// Plugin state, shared between the window hooks and the commands.
@@ -62,6 +85,10 @@ pub(crate) struct Inner {
   config: OnceLock<Config>,
   /// One entry per managed window. Removing an entry stops its threads.
   watchers: Mutex<HashMap<String, Watcher>>,
+  /// The corner each window was last reported to be in. Keyed by label rather
+  /// than living in the watcher, because the commands need one for a window
+  /// before `attach` has necessarily run.
+  reporters: Mutex<HashMap<String, Reporter>>,
 }
 
 impl Shared {
@@ -69,6 +96,7 @@ impl Shared {
     Shared(Arc::new(Inner {
       config: OnceLock::new(),
       watchers: Mutex::new(HashMap::new()),
+      reporters: Mutex::new(HashMap::new()),
     }))
   }
 
@@ -77,17 +105,34 @@ impl Shared {
   pub(crate) fn config(&self) -> &Config {
     self.0.config.get_or_init(Config::default)
   }
+
+  /// The anchor reporter for one window, created on first ask.
+  ///
+  /// Every caller gets the same one for a given label, which is what keeps a
+  /// corner from being announced twice by two different code paths.
+  pub(crate) fn reporter(&self, label: &str) -> Reporter {
+    self
+      .0
+      .reporters
+      .lock()
+      .expect("corner-snap reporter registry is not poisoned")
+      .entry(label.to_string())
+      .or_default()
+      .clone()
+  }
 }
 
 /// Resizes the window to a named state and puts it back against an anchor.
 ///
 /// Shared by the `set_state` command and the initial placement, so a window
-/// opens in exactly the shape a later `set_state` would give it.
+/// opens in exactly the shape a later `set_state` would give it. Emits
+/// [`ANCHOR_EVENT`] through `reporter` if the window ends up in a new corner.
 pub(crate) fn apply_state<R: Runtime>(
   window: &Window<R>,
   config: &Config,
   name: &str,
   anchor_override: Option<Anchor>,
+  reporter: &Reporter,
 ) -> Result<(), String> {
   let state = config.states.get(name).ok_or_else(|| {
     format!(
@@ -144,11 +189,16 @@ pub(crate) fn apply_state<R: Runtime>(
 
   if shrinking {
     window.set_size(logical).map_err(|error| error.to_string())?;
-    window.set_position(target).map_err(|error| error.to_string())
+    window.set_position(target).map_err(|error| error.to_string())?;
   } else {
     window.set_position(target).map_err(|error| error.to_string())?;
-    window.set_size(logical).map_err(|error| error.to_string())
+    window.set_size(logical).map_err(|error| error.to_string())?;
   }
+
+  // Announced only once the window is actually there, so a listener that reads
+  // the window's position when it hears this sees the corner it was told about.
+  reporter.report(window, anchor);
+  Ok(())
 }
 
 /// Starts managing `window`: places it, watches it, and cleans up after it.
@@ -160,19 +210,26 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
     return;
   }
 
+  let reporter = shared.reporter(&label);
+
   // Done before the watcher starts, so the first move the watcher sees is a
   // real one rather than this placement.
   if let Some(state) = &config.initial_state {
-    if let Err(error) = apply_state(&window, config, state, config.initial_anchor) {
+    if let Err(error) = apply_state(&window, config, state, config.initial_anchor, &reporter) {
       log::error!("corner-snap: could not place {label}: {error}");
     }
   }
 
+  // Nothing is listening this early -- the webview has not run a line of its
+  // own code yet -- so the corner from that placement is announced to an empty
+  // room. The `current_anchor` command is how the page catches up once it is
+  // running; the event is for everything after that.
   let watcher = watcher::spawn(
     window.clone(),
     config.edge_margin,
     config.snap_delay,
     config.placement_check,
+    reporter,
   );
 
   // Unplugging a monitor leaves the window at coordinates that exist on no
@@ -243,6 +300,12 @@ fn detach<R: Runtime>(window: &Window<R>, shared: &Shared) {
   if let Ok(mut watchers) = shared.0.watchers.lock() {
     watchers.remove(window.label());
   }
+
+  // A window that comes back under the same label should be announced afresh
+  // rather than inheriting the corner the old one died in.
+  if let Ok(mut reporters) = shared.0.reporters.lock() {
+    reporters.remove(window.label());
+  }
 }
 
 /// Complains about anything that will only show up later as a command failing.
@@ -264,7 +327,11 @@ fn build<R: Runtime>(shared: Shared) -> TauriPlugin<R, Option<Config>> {
   let for_setup = shared.clone();
 
   Builder::<R, Option<Config>>::new("corner-snap")
-    .invoke_handler(tauri::generate_handler![commands::set_state, commands::snap])
+    .invoke_handler(tauri::generate_handler![
+      commands::set_state,
+      commands::snap,
+      commands::current_anchor
+    ])
     .setup(move |app, api| {
       // A config passed to `init_with` is already in place, so this only has an
       // effect for `init`. An absent `plugins.corner-snap` arrives as null,

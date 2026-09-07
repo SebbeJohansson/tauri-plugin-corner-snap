@@ -97,7 +97,8 @@ back to that corner on every expand.
 ## Commands
 
 Granted together by `corner-snap:default`, or individually as
-`corner-snap:allow-set-state` and `corner-snap:allow-snap`.
+`corner-snap:allow-set-state`, `corner-snap:allow-snap` and
+`corner-snap:allow-current-anchor`.
 
 ```ts
 import { invoke } from '@tauri-apps/api/core'
@@ -108,7 +109,48 @@ await invoke('plugin:corner-snap|set_state', { state: 'collapsed' })
 
 // Re-park now, without waiting for the periodic check.
 await invoke('plugin:corner-snap|snap')
+
+// Which corner the window is in: 'topLeft' | 'topRight' | 'bottomLeft' |
+// 'bottomRight', or null if no monitor was reported.
+const corner = await invoke('plugin:corner-snap|current_anchor')
 ```
+
+## Events
+
+The plugin emits `corner-snap://anchor` whenever the window settles into a
+*different* corner — after a drag, after a `set_state` that moves it, and after
+a display change re-parks it. Repeats are swallowed, so a window that stays put
+emits nothing however often the placement check runs.
+
+The event is sent to the window it is about, not broadcast, so a second managed
+window does not have to filter out the first one's corners. The payload carries
+the label anyway, for a listener on the app handle:
+
+```ts
+{ label: 'main', anchor: 'bottomRight' }
+```
+
+The first corner is settled while the window is still being created, before the
+page has run a line of its own code, so that one event goes out to an empty
+room. Ask once on startup and listen from then on:
+
+```ts
+import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+
+let corner = await invoke('plugin:corner-snap|current_anchor')
+
+await getCurrentWindow().listen('corner-snap://anchor', ({ payload }) => {
+  corner = payload.anchor
+})
+```
+
+That is the hook for anything that should follow the window: opening a menu
+upwards in the bottom corners, putting a badge on the side facing the screen,
+pointing a tooltip inwards.
+
+From Rust the event name and payload type are exported as `ANCHOR_EVENT` and
+`AnchorChanged`.
 
 ## How it works
 
@@ -130,4 +172,4 @@ check is the only mechanism, which is why it exists.
 - Snapping is corner-only. There is no edge or free placement mode.
 - The plugin does not track which state a window is in; the webview owns that.
   `set_state` is idempotent, so restating it after a reload is the way to
-  recover.
+  recover. The *corner* it does track, and reports.

@@ -2,7 +2,7 @@
 
 [default]
 description = """
-Lets the webview move the window between its configured states, and ask for
-it to be re-parked against its anchor.
+Lets the webview move the window between its configured states, ask for it to
+be re-parked against its anchor, and read which corner it is in.
 """
-permissions = ["allow-set-state", "allow-snap"]
+permissions = ["allow-set-state", "allow-snap", "allow-current-anchor"]
