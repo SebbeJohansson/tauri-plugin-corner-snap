@@ -2,15 +2,15 @@
 
 use tauri::{Runtime, State, Window};
 
-use crate::geometry::{self, snap_to_nearest_anchor};
-use crate::{apply_state, Anchor, Shared};
+use crate::{measure, reposition, Placement, Shared};
 
-/// Resizes the window to a named state, keeping it against an anchor.
+/// Resizes the window to a named state and re-parks it.
 ///
-/// The webview owns which state is current, since it also decides what to draw.
-/// Calling this on startup lets the window recover after a reload in
-/// development. An unknown name is an error, so a typo surfaces in the
-/// webview's `catch` instead of silently doing nothing.
+/// The webview owns which state is current, since it also decides what to draw;
+/// this is how it tells the plugin, which needs to know to work out what size a
+/// slot should give the window. Calling it on startup lets the window recover
+/// after a reload in development. An unknown name is an error, so a typo
+/// surfaces in the webview's `catch` instead of silently doing nothing.
 #[tauri::command]
 pub(crate) fn set_state<R: Runtime>(
   window: Window<R>,
@@ -18,7 +18,7 @@ pub(crate) fn set_state<R: Runtime>(
   state: String,
 ) -> Result<(), String> {
   let config = shared.config().clone();
-  let reporter = shared.reporter(window.label());
+  let tracked = shared.tracked(window.label());
 
   // Checked here, on the way in, so an unconfigured name still comes back to
   // the webview as a rejected promise rather than disappearing into a thread.
@@ -28,6 +28,10 @@ pub(crate) fn set_state<R: Runtime>(
       config.state_names()
     ));
   }
+
+  // Recorded before the thread starts, so a second call landing while the first
+  // is still working sees the newer state rather than racing it.
+  tracked.set_state(&state);
 
   // Moving the work to a thread is the point here, not an optimisation.
   //
@@ -44,7 +48,9 @@ pub(crate) fn set_state<R: Runtime>(
   // `send_user_message`: posted to the event loop and run between callbacks,
   // which is where resizing a window is safe.
   std::thread::spawn(move || {
-    if let Err(error) = apply_state(&window, &config, &state, None, &reporter) {
+    // No anchor override: the state's own `anchor` decides, and failing that
+    // the window stays in whichever slot the user left it in.
+    if let Err(error) = reposition(&window, &config, &tracked, None, &mut None) {
       log::error!("corner-snap: set_state({state:?}) failed: {error}");
     }
   });
@@ -52,38 +58,37 @@ pub(crate) fn set_state<R: Runtime>(
   Ok(())
 }
 
-/// Re-parks the window against its nearest anchor, without waiting for the
+/// Re-parks the window against its nearest slot, without waiting for the
 /// periodic check. Useful after the webview changes something that moves it.
 ///
-/// Threaded for the same reason as [`set_state`], which is also why the corner
-/// comes back as an event rather than a return value.
+/// Threaded for the same reason as [`set_state`], which is also why the
+/// placement comes back as an event rather than a return value.
 #[tauri::command]
 pub(crate) fn snap<R: Runtime>(
   window: Window<R>,
   shared: State<'_, Shared>,
 ) -> Result<(), String> {
-  let edge_margin = shared.config().edge_margin;
-  let reporter = shared.reporter(window.label());
+  let config = shared.config().clone();
+  let tracked = shared.tracked(window.label());
 
   std::thread::spawn(move || {
-    match snap_to_nearest_anchor(&window, edge_margin, &mut None) {
-      Ok(Some(anchor)) => reporter.report(&window, anchor),
-      Ok(None) => {}
-      Err(error) => log::error!("corner-snap: snap failed: {error}"),
+    if let Err(error) = reposition(&window, &config, &tracked, None, &mut None) {
+      log::error!("corner-snap: snap failed: {error}");
     }
   });
 
   Ok(())
 }
 
-/// Which corner the window is in right now.
+/// Where the window is right now: the slot it occupies and which way round it
+/// is.
 ///
-/// The corner is also emitted as `corner-snap://anchor` whenever it changes,
-/// but the first of those goes out while the window is being created, long
-/// before the page can listen for it. So a webview that cares about the corner
-/// asks once on startup and listens from then on.
+/// The same thing is emitted as `corner-snap://anchor` whenever it changes, but
+/// the first of those goes out while the window is being created, long before
+/// the page can listen for it. So a webview that cares asks once on startup and
+/// listens from then on.
 ///
-/// Measured rather than remembered, falling back to the last corner reported
+/// Measured rather than remembered, falling back to the last placement reported
 /// when there is no monitor to measure against. `null` means neither was
 /// available: under WSLg no monitors are reported at all.
 ///
@@ -94,17 +99,17 @@ pub(crate) fn snap<R: Runtime>(
 pub(crate) fn current_anchor<R: Runtime>(
   window: Window<R>,
   shared: State<'_, Shared>,
-) -> Option<Anchor> {
-  let reporter = shared.reporter(window.label());
+) -> Option<Placement> {
+  let tracked = shared.tracked(window.label());
 
-  match geometry::current_anchor(&window) {
+  match measure(&window, shared.config(), &tracked) {
     // Noted rather than reported: an event repeating the value being returned
     // to the caller is not news. It keeps the next real change honest, though,
     // so a window that was moved by something else does not go unannounced.
-    Some(anchor) => {
-      reporter.note(anchor);
-      Some(anchor)
+    Some(placement) => {
+      tracked.reporter().note(placement);
+      Some(placement)
     }
-    None => reporter.last(),
+    None => tracked.reporter().last(),
   }
 }

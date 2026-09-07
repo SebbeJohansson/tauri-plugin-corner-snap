@@ -1,36 +1,160 @@
 //! Working out where a window belongs on the screen it is on.
+//!
+//! Everything here is arithmetic over an [`Area`] and a [`Rect`], deliberately
+//! kept clear of the config: the module that knows what a state is builds the
+//! candidate [`Slot`]s and hands them over. That also makes the placement maths
+//! testable without a display, which matters more than usual here -- WSLg
+//! reports no monitors, so a test that needed one could never run.
 
 use tauri::{Monitor, PhysicalPosition, PhysicalSize, Runtime, Window};
 
-/// A corner of the monitor's work area to hold a window against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+/// A place on the monitor's work area to hold a window against.
+///
+/// Nine slots: the four corners, the middle of each of the four edges, and the
+/// centre. The four corner names are the ones this plugin shipped with and mean
+/// exactly what they always did.
+#[derive(
+  Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum Anchor {
   TopLeft,
+  Top,
   TopRight,
+  Left,
+  Center,
+  Right,
   BottomLeft,
+  Bottom,
   BottomRight,
 }
 
+/// Where a window sits on one axis.
+///
+/// The two-bool `(right, bottom)` pair this replaced could not say "centred",
+/// which is the whole reason edge slots were impossible to express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Align {
+  Start,
+  Center,
+  End,
+}
+
+/// Every slot, in reading order.
+///
+/// Handy for a config written in Rust that wants to offer the lot:
+/// `snap_to: ALL_ANCHORS.to_vec()`.
+pub const ALL_ANCHORS: [Anchor; 9] = [
+  Anchor::TopLeft,
+  Anchor::Top,
+  Anchor::TopRight,
+  Anchor::Left,
+  Anchor::Center,
+  Anchor::Right,
+  Anchor::BottomLeft,
+  Anchor::Bottom,
+  Anchor::BottomRight,
+];
+
+/// The four corners: what `snapTo` defaults to, so a config written before edge
+/// slots existed behaves exactly as it did.
+pub(crate) const CORNERS: [Anchor; 4] = [
+  Anchor::TopLeft,
+  Anchor::TopRight,
+  Anchor::BottomLeft,
+  Anchor::BottomRight,
+];
+
 impl Anchor {
-  /// (towards the right edge, towards the bottom edge).
-  pub fn flags(self) -> (bool, bool) {
+  /// Alignment on the horizontal and vertical axes, in that order.
+  pub(crate) fn aligns(self) -> (Align, Align) {
+    use Align::{Center, End, Start};
     match self {
-      Anchor::TopLeft => (false, false),
-      Anchor::TopRight => (true, false),
-      Anchor::BottomLeft => (false, true),
-      Anchor::BottomRight => (true, true),
+      Anchor::TopLeft => (Start, Start),
+      Anchor::Top => (Center, Start),
+      Anchor::TopRight => (End, Start),
+      Anchor::Left => (Start, Center),
+      Anchor::Center => (Center, Center),
+      Anchor::Right => (End, Center),
+      Anchor::BottomLeft => (Start, End),
+      Anchor::Bottom => (Center, End),
+      Anchor::BottomRight => (End, End),
     }
   }
 
-  pub fn from_flags(right: bool, bottom: bool) -> Self {
-    match (right, bottom) {
-      (false, false) => Anchor::TopLeft,
-      (true, false) => Anchor::TopRight,
-      (false, true) => Anchor::BottomLeft,
-      (true, true) => Anchor::BottomRight,
+  /// Whether this slot is docked to one edge and centred along it.
+  ///
+  /// True for the four edge middles and nothing else. A corner touches two
+  /// edges, so "the edge it is docked to" has no answer there, and the centre
+  /// touches none.
+  pub(crate) fn is_side(self) -> bool {
+    matches!(
+      self,
+      Anchor::Top | Anchor::Right | Anchor::Bottom | Anchor::Left
+    )
+  }
+
+  /// Whether a window in this slot runs up and down the screen.
+  ///
+  /// This is what decides whether a state's `verticalSize` is used, and which
+  /// axis `fill` stretches.
+  pub(crate) fn runs_vertically(self) -> bool {
+    matches!(self, Anchor::Left | Anchor::Right)
+  }
+}
+
+/// A rectangle in physical pixels: a monitor's work area, or a window.
+///
+/// Tauri's own rectangle type is not named the same way across the versions
+/// this has to build against, so the monitor's work area is copied into this
+/// on the way in. It also lets the tests below build one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Area {
+  pub position: PhysicalPosition<i32>,
+  pub size: PhysicalSize<u32>,
+}
+
+impl Area {
+  /// The monitor's work area: the screen minus the taskbar.
+  pub fn of(monitor: &Monitor) -> Self {
+    let area = monitor.work_area();
+    Area {
+      position: PhysicalPosition::new(area.position.x, area.position.y),
+      size: PhysicalSize::new(area.size.width, area.size.height),
     }
   }
+}
+
+/// Where a window is and how big it is, as one value.
+///
+/// Both loop guards below compare whole rectangles rather than positions,
+/// because a snap can now resize as well as move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+  pub position: PhysicalPosition<i32>,
+  pub size: PhysicalSize<u32>,
+}
+
+impl Rect {
+  pub fn centre(&self) -> PhysicalPosition<i32> {
+    PhysicalPosition::new(
+      self.position.x + self.size.width as i32 / 2,
+      self.position.y + self.size.height as i32 / 2,
+    )
+  }
+}
+
+/// The rectangle a window would occupy if it snapped to one anchor.
+///
+/// Candidates are compared as the rectangle they would *land* in, not the one
+/// the window is in now. That is what makes a rotating widget pick the right
+/// slot: the `right` candidate is measured as the tall narrow bar it would
+/// become, so dragging to the right edge halfway down beats `topRight` on its
+/// own merits, with no thresholds involved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot {
+  pub anchor: Anchor,
+  pub rect: Rect,
 }
 
 /// Finds a monitor to work against, trying the most specific source first.
@@ -50,134 +174,273 @@ pub fn pick_monitor<R: Runtime>(window: &Window<R>) -> Option<Monitor> {
     .and_then(|monitors| monitors.into_iter().next())
 }
 
-/// Position that puts a window of `size` in one corner of the monitor's work
-/// area, which is the screen minus the taskbar.
+/// Where a window of `size` sits when held against `anchor`.
+///
+/// `edge_margin` is a gap from the edges the window is held against. It is not
+/// applied to a centred axis: there is no edge there to be away from.
 pub fn anchor_position(
-  monitor: &Monitor,
+  area: &Area,
   size: PhysicalSize<u32>,
-  corner: Anchor,
+  anchor: Anchor,
   edge_margin: i32,
 ) -> PhysicalPosition<i32> {
-  let (right, bottom) = corner.flags();
-  let area = monitor.work_area();
-  let width = size.width as i32;
-  let height = size.height as i32;
+  let (horizontal, vertical) = anchor.aligns();
 
-  let x = if right {
-    area.position.x + area.size.width as i32 - width - edge_margin
-  } else {
-    area.position.x + edge_margin
-  };
-  let y = if bottom {
-    area.position.y + area.size.height as i32 - height - edge_margin
-  } else {
-    area.position.y + edge_margin
-  };
-
-  PhysicalPosition::new(x, y)
+  PhysicalPosition::new(
+    place_axis(
+      area.position.x,
+      area.size.width as i32,
+      size.width as i32,
+      horizontal,
+      edge_margin,
+    ),
+    place_axis(
+      area.position.y,
+      area.size.height as i32,
+      size.height as i32,
+      vertical,
+      edge_margin,
+    ),
+  )
 }
 
-/// Which anchor of `monitor` a window of `size` currently sits at.
-///
-/// Centres are compared rather than edges, so the corner the window mostly
-/// occupies wins even when it hangs off the side of the screen.
-pub fn occupied_anchor<R: Runtime>(
-  window: &Window<R>,
-  monitor: &Monitor,
-  size: PhysicalSize<u32>,
-) -> tauri::Result<Anchor> {
-  let area = monitor.work_area();
-  let position = window.outer_position()?;
-
-  let window_centre_x = position.x + size.width as i32 / 2;
-  let window_centre_y = position.y + size.height as i32 / 2;
-  let area_centre_x = area.position.x + area.size.width as i32 / 2;
-  let area_centre_y = area.position.y + area.size.height as i32 / 2;
-
-  Ok(Anchor::from_flags(
-    window_centre_x >= area_centre_x,
-    window_centre_y >= area_centre_y,
-  ))
-}
-
-/// Moves the window to whichever corner it now sits closest to, and reports
-/// the corner it ended up in.
-///
-/// `Ok(None)` means the corner could not be worked out at all -- there is no
-/// monitor to measure against, or the window is minimized -- as opposed to
-/// `Ok(Some(_))`, which is the corner the window occupies whether this call
-/// moved it there or found it already parked.
-///
-/// `last_attempt` remembers the (position, target) pair of the previous move so
-/// a window that cannot be moved is not chased forever; pass `&mut None` for a
-/// one-off request that should always try.
-pub fn snap_to_nearest_anchor<R: Runtime>(
-  window: &Window<R>,
+/// One axis of [`anchor_position`].
+fn place_axis(
+  area_start: i32,
+  area_length: i32,
+  window_length: i32,
+  align: Align,
   edge_margin: i32,
-  last_attempt: &mut Option<(PhysicalPosition<i32>, PhysicalPosition<i32>)>,
-) -> tauri::Result<Option<Anchor>> {
-  // A minimized window sits at a sentinel position far off every screen, and
-  // `set_position` on it changes only where it will restore to, never what it
-  // reports now. So the "already parked" check below can never be satisfied,
-  // and every move we make raises another move event: the window is chased at
-  // full speed, the message loop stops being serviced, and Windows replaces it
-  // with a "Not Responding" ghost. Restoring raises its own move event, which
-  // is when placement picks up again.
-  if window.is_minimized().unwrap_or(false) {
-    log::debug!("corner-snap: window is minimized; leaving it alone");
-    return Ok(None);
+) -> i32 {
+  match align {
+    Align::Start => area_start + edge_margin,
+    Align::Center => area_start + (area_length - window_length) / 2,
+    Align::End => area_start + area_length - window_length - edge_margin,
   }
-
-  let Some(monitor) = pick_monitor(window) else {
-    // Logged quietly: the placement check runs on a timer, and under WSLg this
-    // is the normal answer every time.
-    log::debug!("corner-snap: no monitor reported; cannot snap");
-    return Ok(None);
-  };
-
-  let size = window.outer_size()?;
-  let anchor = occupied_anchor(window, &monitor, size)?;
-  let target = anchor_position(&monitor, size, anchor, edge_margin);
-  let position = window.outer_position()?;
-
-  // Setting the position raises another move event. Stopping here when the
-  // window is already parked keeps that from looping.
-  if position == target {
-    *last_attempt = None;
-    return Ok(Some(anchor));
-  }
-
-  // The same move, from the same place, as last time: it did not take, so the
-  // window is somewhere it cannot be moved from. Backstop for anything that
-  // pins a window the way minimizing does; without it the retry raises another
-  // move event and nothing ever breaks the cycle.
-  if *last_attempt == Some((position, target)) {
-    log::warn!(
-      "corner-snap: window would not move from {position:?} to {target:?}; \
-       leaving it until something else changes"
-    );
-    // Still the corner it occupies, even though it is not the slot in it.
-    return Ok(Some(anchor));
-  }
-
-  *last_attempt = Some((position, target));
-  window.set_position(target)?;
-  Ok(Some(anchor))
 }
 
-/// The corner `window` occupies right now, measured rather than remembered.
+/// The slot whose landing rectangle is centred nearest `centre`.
 ///
-/// `None` when there is nothing to measure against, which under WSLg is the
-/// only answer there is.
-pub fn current_anchor<R: Runtime>(window: &Window<R>) -> Option<Anchor> {
-  // A minimized window reports a sentinel position far off every screen, which
-  // measures as a perfectly confident top-left. Better to say nothing and let
-  // the caller fall back to the corner it was in before it was minimized.
-  if window.is_minimized().unwrap_or(false) {
-    return None;
+/// Centres are compared rather than nearest edges. Measuring to the nearest
+/// point of each candidate looks more natural until a slot is stretched: a
+/// full-height right-hand bar has a zero vertical term, so *anything* on the
+/// right half of the screen reads as touching it and the two right-hand corners
+/// become unreachable. Comparing centres keeps every slot winnable, and it
+/// needs no thresholds -- a widget dropped in the top-right is a few tens of
+/// pixels from the `topRight` centre and several hundred from the full-height
+/// `right` one.
+///
+/// Ties go to whichever slot comes first in `slots`.
+pub fn nearest(centre: PhysicalPosition<i32>, slots: &[Slot]) -> Option<Slot> {
+  slots
+    .iter()
+    .min_by_key(|slot| {
+      let slot_centre = slot.rect.centre();
+      let dx = (slot_centre.x - centre.x) as i64;
+      let dy = (slot_centre.y - centre.y) as i64;
+      dx * dx + dy * dy
+    })
+    .copied()
+}
+
+/// Where the window is and how big it is, right now.
+pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
+  Ok(Rect {
+    position: window.outer_position()?,
+    size: window.outer_size()?,
+  })
+}
+
+/// Moves and resizes a window into `target` without it ever occupying a
+/// rectangle outside the work area.
+///
+/// That guarantee is the whole point of the three steps, and it is not
+/// negotiable: moving a transparent, always-on-top window off the edge of the
+/// screen is what took the process down.
+///
+/// The naive version picks an order -- size then move, or move then size --
+/// from whether the window is growing. That works only while one bool can
+/// describe the change. A rotation shrinks one axis and grows the other, so
+/// "growing" is false and the window moves first; a 260x90 sent to the `right`
+/// slot's x (`right_edge - 90 - margin`) hangs 170px off the screen. Turning on
+/// `fill` makes it worse, growing the height fifteen-fold.
+///
+/// So: shrink to the per-axis minimum of the two sizes, move, then grow. Every
+/// intermediate rectangle is inside the work area --
+///
+/// - shrinking about the window's own top-left, from any rectangle that is
+///   inside, stays inside: the rectangle only moves away from the edges it was
+///   held against;
+/// - the waypoint is no larger than the target on either axis, and the target
+///   position was computed for the target size, so the waypoint fits inside a
+///   rectangle that itself fits;
+/// - the final grow lands exactly on the slot.
+///
+/// -- and it subsumes both of the orders it replaces rather than adding a third.
+/// A step that would change nothing is skipped, so a pure move still raises one
+/// message rather than three.
+pub fn move_into<R: Runtime>(
+  window: &Window<R>,
+  from: PhysicalSize<u32>,
+  target: Rect,
+) -> tauri::Result<()> {
+  let waypoint = PhysicalSize::new(
+    from.width.min(target.size.width),
+    from.height.min(target.size.height),
+  );
+
+  if waypoint != from {
+    window.set_size(waypoint)?;
+  }
+  window.set_position(target.position)?;
+  if target.size != waypoint {
+    window.set_size(target.size)?;
   }
 
-  let monitor = pick_monitor(window)?;
-  let size = window.outer_size().ok()?;
-  occupied_anchor(window, &monitor, size).ok()
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A 1920x1080 screen with a 40px taskbar along the bottom, offset so that a
+  /// test cannot pass by treating the work area as starting at the origin.
+  fn area() -> Area {
+    Area {
+      position: PhysicalPosition::new(100, 200),
+      size: PhysicalSize::new(1920, 1040),
+    }
+  }
+
+  fn slot(anchor: Anchor, size: PhysicalSize<u32>, margin: i32) -> Slot {
+    Slot {
+      anchor,
+      rect: Rect {
+        position: anchor_position(&area(), size, anchor, margin),
+        size,
+      },
+    }
+  }
+
+  #[test]
+  fn corners_sit_a_margin_in_from_both_edges() {
+    let size = PhysicalSize::new(260, 90);
+
+    assert_eq!(
+      anchor_position(&area(), size, Anchor::TopLeft, 16),
+      PhysicalPosition::new(116, 216)
+    );
+    assert_eq!(
+      anchor_position(&area(), size, Anchor::BottomRight, 16),
+      // 100 + 1920 - 260 - 16, 200 + 1040 - 90 - 16
+      PhysicalPosition::new(1744, 1134)
+    );
+  }
+
+  #[test]
+  fn an_edge_slot_is_centred_along_that_edge() {
+    let size = PhysicalSize::new(90, 320);
+    let position = anchor_position(&area(), size, Anchor::Right, 16);
+
+    // Held against the right edge by the margin, centred vertically.
+    assert_eq!(position.x, 100 + 1920 - 90 - 16);
+    assert_eq!(position.y, 200 + (1040 - 320) / 2);
+  }
+
+  /// The margin is a gap from an edge the window is held against. A centred
+  /// axis has no such edge, so applying it there would shift the window off
+  /// centre for no reason.
+  #[test]
+  fn the_margin_does_not_apply_to_a_centred_axis() {
+    let size = PhysicalSize::new(90, 320);
+
+    assert_eq!(
+      anchor_position(&area(), size, Anchor::Right, 0).y,
+      anchor_position(&area(), size, Anchor::Right, 64).y
+    );
+  }
+
+  #[test]
+  fn the_centre_slot_is_centred_on_both_axes() {
+    let size = PhysicalSize::new(260, 90);
+    let position = anchor_position(&area(), size, Anchor::Center, 16);
+
+    assert_eq!(position.x, 100 + (1920 - 260) / 2);
+    assert_eq!(position.y, 200 + (1040 - 90) / 2);
+  }
+
+  /// A window stretched to the full length of an edge ends up a margin in from
+  /// *both* ends of it, which is why the margin is subtracted twice when the
+  /// stretched length is worked out.
+  #[test]
+  fn a_fully_stretched_window_clears_both_ends_by_the_margin() {
+    let size = PhysicalSize::new(90, 1040 - 2 * 16);
+    let position = anchor_position(&area(), size, Anchor::Right, 16);
+
+    assert_eq!(position.y, 200 + 16);
+    assert_eq!(position.y + size.height as i32, 200 + 1040 - 16);
+  }
+
+  #[test]
+  fn a_window_dropped_in_a_corner_picks_that_corner() {
+    let panel = PhysicalSize::new(260, 90);
+    let slots: Vec<Slot> = CORNERS
+      .iter()
+      .map(|&anchor| slot(anchor, panel, 16))
+      .collect();
+
+    let found = nearest(PhysicalPosition::new(180, 260), &slots).expect("a slot");
+    assert_eq!(found.anchor, Anchor::TopLeft);
+  }
+
+  /// The case the whole feature exists for: a wide panel that becomes a tall
+  /// bar on the side. Dropped against the right edge halfway down, the tall
+  /// candidate has to win, and dropped in the corner the wide one has to.
+  #[test]
+  fn a_rotating_widget_prefers_the_side_only_away_from_the_corners() {
+    let panel = PhysicalSize::new(260, 90);
+    let bar = PhysicalSize::new(90, 1040 - 32);
+    let mut slots: Vec<Slot> = CORNERS
+      .iter()
+      .map(|&anchor| slot(anchor, panel, 16))
+      .collect();
+    slots.push(slot(Anchor::Right, bar, 16));
+
+    // Right edge, halfway down.
+    let middle = nearest(PhysicalPosition::new(1980, 720), &slots).expect("a slot");
+    assert_eq!(middle.anchor, Anchor::Right);
+    assert_eq!(middle.rect.size, bar);
+
+    // Right edge, hard against the top.
+    let corner = nearest(PhysicalPosition::new(1980, 240), &slots).expect("a slot");
+    assert_eq!(corner.anchor, Anchor::TopRight);
+    assert_eq!(corner.rect.size, panel);
+  }
+
+  /// Slots the config does not allow are simply not candidates, which is what
+  /// keeps a wide panel out of the `top` slot without any special case.
+  #[test]
+  fn only_the_slots_offered_can_be_chosen() {
+    let panel = PhysicalSize::new(260, 90);
+    let slots = [slot(Anchor::BottomLeft, panel, 16)];
+
+    let found = nearest(PhysicalPosition::new(1980, 240), &slots).expect("a slot");
+    assert_eq!(found.anchor, Anchor::BottomLeft);
+  }
+
+  #[test]
+  fn nothing_is_nearest_to_no_slots() {
+    assert_eq!(nearest(PhysicalPosition::new(0, 0), &[]), None);
+  }
+
+  #[test]
+  fn a_rectangle_reports_its_own_centre() {
+    let rect = Rect {
+      position: PhysicalPosition::new(100, 200),
+      size: PhysicalSize::new(260, 90),
+    };
+
+    assert_eq!(rect.centre(), PhysicalPosition::new(230, 245));
+  }
 }

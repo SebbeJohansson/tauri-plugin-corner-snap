@@ -7,12 +7,11 @@
 
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
 
 use tauri::{Runtime, Window};
 
-use crate::geometry::snap_to_nearest_anchor;
-use crate::report::Reporter;
+use crate::config::Config;
+use crate::{reposition, Tracked};
 
 /// Everything holding a managed window's threads open.
 ///
@@ -33,27 +32,26 @@ impl Watcher {
 
 /// Starts both threads for `window`.
 ///
-/// `snap_delay` is how long the window must sit still before it is treated as
-/// dropped: dragging is handled by the operating system, which reports a stream
-/// of moves but no "drag finished" event, so the end of a drag is inferred from
-/// the window going quiet.
+/// `config.snap_delay` is how long the window must sit still before it is
+/// treated as dropped: dragging is handled by the operating system, which
+/// reports a stream of moves but no "drag finished" event, so the end of a drag
+/// is inferred from the window going quiet.
 ///
-/// `placement_check` is how often the placement is re-checked. On Windows the
-/// display messages do the real work, so this is a backstop for anything they
-/// miss, and the only mechanism on other platforms. Keep it slow: a window at
-/// dead coordinates is rare, and re-checking often means fighting anything else
-/// that legitimately moves the window.
+/// `config.placement_check` is how often the placement is re-checked. On
+/// Windows the display messages do the real work, so this is a backstop for
+/// anything they miss, and the only mechanism on other platforms. Keep it slow:
+/// a window at dead coordinates is rare, and re-checking often means fighting
+/// anything else that legitimately moves the window.
 ///
-/// `reporter` announces the corner each snap settles on. It ignores repeats, so
-/// the ticker below can run forever without saying anything.
-pub fn spawn<R: Runtime>(
-  window: Window<R>,
-  edge_margin: i32,
-  snap_delay: Duration,
-  placement_check: Duration,
-  reporter: Reporter,
-) -> Watcher {
+/// `tracked` carries both the state the window is in -- which is what decides
+/// the size a slot gets -- and the reporter that announces where it lands. The
+/// reporter ignores repeats, so the ticker can run forever without saying
+/// anything.
+pub fn spawn<R: Runtime>(window: Window<R>, config: Config, tracked: Tracked) -> Watcher {
   let (moves, receiver) = mpsc::channel::<()>();
+
+  let snap_delay = config.snap_delay;
+  let placement_check = config.placement_check;
 
   let label = window.label().to_string();
   thread::spawn(move || {
@@ -65,12 +63,16 @@ pub fn spawn<R: Runtime>(
       // Swallow the rest of the stream until the window has been still.
       while receiver.recv_timeout(snap_delay).is_ok() {}
 
-      match snap_to_nearest_anchor(&window, edge_margin, &mut last_attempt) {
-        Ok(Some(anchor)) => reporter.report(&window, anchor),
-        // No monitor to measure against, or the window is minimized. Reporting
-        // nothing is right here: the corner is unknown, not changed.
-        Ok(None) => {}
-        Err(error) => log::error!("corner-snap: could not snap {label}: {error}"),
+      // Resizing from here is safe for the same reason `set_state` spawns a
+      // thread: this is not the main thread, so Tauri posts the calls to the
+      // event loop to run between callbacks rather than re-entering it
+      // mid-dispatch. See the long comment in `commands.rs`.
+      //
+      // No anchor override: the whole point of this thread is to pick the slot
+      // from where the window was dropped.
+      if let Err(error) = reposition(&window, &config, &tracked, None, &mut last_attempt)
+      {
+        log::error!("corner-snap: could not place {label}: {error}");
       }
     }
   });

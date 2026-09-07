@@ -1,0 +1,4 @@
+# The style this codebase was written in, pinned so `cargo fmt` keeps it rather
+# than converting everything to rustfmt's 4-space default.
+tab_spaces = 2
+max_width = 90
