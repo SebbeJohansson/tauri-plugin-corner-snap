@@ -167,6 +167,7 @@ quietly doing nothing.
 | `snapDelayMs` | `250` | How long the window must sit still before a drag counts as finished. |
 | `placementCheckMs` | `10000` | Backstop re-check interval. |
 | `manage` | `"all"` | `"all"`, or `{ "labels": ["main"] }`. |
+| `windows` | `{}` | Per-label overrides of `initialState` and `initialAnchor`. |
 
 A state takes a size in logical pixels and four optional keys:
 
@@ -177,6 +178,33 @@ A state takes a size in logical pixels and four optional keys:
 | `fill` | `false` | Stretch along the docked edge. `true`, `false`, or a fraction. |
 | `anchor` | `null` | Slot to move to every time the window enters this state. |
 | `snapTo` | inherits | Narrows the config's slot list for this state alone. |
+
+### Two windows, two corners
+
+`states` is shared on purpose: names are global, each window picks the one it
+wants, and two widgets of the same size cost one entry. What cannot be shared is
+where a window *opens* — so `windows` overrides that per label:
+
+```json
+{
+  "states": {
+    "expanded": { "size": [260, 90] },
+    "collapsed": { "size": [44, 44] }
+  },
+  "initialState": "expanded",
+  "initialAnchor": "bottomLeft",
+  "manage": { "labels": ["main", "kaggriculture"] },
+  "windows": {
+    "kaggriculture": { "initialAnchor": "bottomRight" }
+  }
+}
+```
+
+`main` opens bottom-left, `kaggriculture` bottom-right, both in `expanded`, and
+both then keep whichever slot the user drags them into. A key an override does
+not name falls back to the config's own value, so the block above says the one
+thing that differs and nothing else. An override on a label outside
+`manage.labels` is warned about at startup rather than silently ignored.
 
 A state with **no** anchor keeps whichever slot the window is already in, so it
 grows and shrinks where the user left it. A state **with** one moves there every

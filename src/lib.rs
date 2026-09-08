@@ -399,11 +399,14 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
 
   // Done before the watcher starts, so the first move the watcher sees is a
   // real one rather than this placement.
-  if let Some(state) = &config.initial_state {
+  //
+  // Read per window: two managed windows share the states map but open in
+  // their own state and their own corner, which is the whole point of the
+  // `windows` block.
+  let (initial_state, initial_anchor) = config.initial_for(&label);
+  if let Some(state) = initial_state {
     tracked.set_state(state);
-    if let Err(error) =
-      reposition(&window, config, &tracked, config.initial_anchor, &mut None)
-    {
+    if let Err(error) = reposition(&window, config, &tracked, initial_anchor, &mut None) {
       log::error!("corner-snap: could not place {label}: {error}");
     }
   }
@@ -498,6 +501,26 @@ fn warn_about(config: &Config) {
         "corner-snap: initialState '{state}' is not one of: {}",
         config.state_names()
       );
+    }
+  }
+
+  for (label, over) in &config.windows {
+    // An override on a window the plugin was never given is silent otherwise:
+    // the window opens wherever Tauri put it and nothing explains why.
+    if !config.manage.covers(label) {
+      log::warn!(
+        "corner-snap: windows.{label} is set but '{label}' is not managed; add it \
+         to manage.labels or the override does nothing"
+      );
+    }
+
+    if let Some(state) = &over.initial_state {
+      if !config.states.contains_key(state) {
+        log::error!(
+          "corner-snap: windows.{label}.initialState '{state}' is not one of: {}",
+          config.state_names()
+        );
+      }
     }
   }
 

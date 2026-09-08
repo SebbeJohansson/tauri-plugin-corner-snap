@@ -180,6 +180,22 @@ impl Manage {
   }
 }
 
+/// What one window does differently, by label.
+///
+/// The `states` map stays shared: names are global and each window picks the
+/// one it wants, so two widgets of the same size cost one entry. But
+/// `initialState` and `initialAnchor` describe a single window's opening move,
+/// and two widgets that open in two different corners cannot share one answer.
+/// Whatever an override does not name falls back to the config's own value.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct WindowOverride {
+  /// State this window enters when it is created.
+  pub initial_state: Option<String>,
+  /// Slot this window opens in.
+  pub initial_anchor: Option<Anchor>,
+}
+
 /// How the plugin behaves.
 ///
 /// Every field has a default, so a `tauri.conf.json` block naming nothing but
@@ -234,6 +250,9 @@ pub struct Config {
   pub placement_check: Duration,
   /// Which windows to manage.
   pub manage: Manage,
+  /// Per-window overrides of the placement settings that apply once, keyed by
+  /// window label. A label with no entry uses the values above.
+  pub windows: HashMap<String, WindowOverride>,
 }
 
 impl Default for Config {
@@ -247,6 +266,7 @@ impl Default for Config {
       snap_delay: Duration::from_millis(250),
       placement_check: Duration::from_secs(10),
       manage: Manage::All,
+      windows: HashMap::new(),
     }
   }
 }
@@ -260,6 +280,20 @@ impl Config {
     let mut names: Vec<&str> = self.states.keys().map(String::as_str).collect();
     names.sort_unstable();
     names.join(", ")
+  }
+
+  /// The state and slot a window opens in: its own override first, then the
+  /// config's shared answer.
+  pub(crate) fn initial_for(&self, label: &str) -> (Option<&String>, Option<Anchor>) {
+    let over = self.windows.get(label);
+    (
+      over
+        .and_then(|over| over.initial_state.as_ref())
+        .or(self.initial_state.as_ref()),
+      over
+        .and_then(|over| over.initial_anchor)
+        .or(self.initial_anchor),
+    )
   }
 
   /// The slots a window in `state` may be dragged into.
@@ -511,6 +545,45 @@ mod tests {
     assert!(Fill::Fraction(0.5).is_sensible());
     assert!(Fill::Full.is_sensible());
     assert!(Fill::None.is_sensible());
+  }
+
+  /// Two widgets, one states map, two corners. Anything a window does not
+  /// override still comes from the config.
+  #[test]
+  fn a_window_can_override_where_it_opens() {
+    let config = parse(
+      r#"{
+        "states": { "expanded": { "size": [260, 90] }, "farm": { "size": [260, 90] } },
+        "initialState": "expanded",
+        "initialAnchor": "bottomLeft",
+        "windows": {
+          "kaggriculture": { "initialState": "farm", "initialAnchor": "bottomRight" },
+          "hud": { "initialAnchor": "topRight" }
+        }
+      }"#,
+    );
+
+    assert_eq!(
+      config.initial_for("main"),
+      (Some(&"expanded".to_string()), Some(Anchor::BottomLeft))
+    );
+    assert_eq!(
+      config.initial_for("kaggriculture"),
+      (Some(&"farm".to_string()), Some(Anchor::BottomRight))
+    );
+    // Named, but only for the corner: the state falls back to the shared one.
+    assert_eq!(
+      config.initial_for("hud"),
+      (Some(&"expanded".to_string()), Some(Anchor::TopRight))
+    );
+  }
+
+  #[test]
+  fn a_config_without_a_windows_block_answers_for_every_label() {
+    let config = parse(r#"{ "states": { "expanded": { "size": [1, 1] } } }"#);
+
+    assert!(config.windows.is_empty());
+    assert_eq!(config.initial_for("main"), (None, None));
   }
 
   #[test]
