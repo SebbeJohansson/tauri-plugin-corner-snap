@@ -258,20 +258,22 @@ pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
 /// it is not negotiable: moving a transparent, always-on-top window off the
 /// edge of the screen is what took the process down.
 ///
-/// On Windows this is one native call instead: `SetWindowPos` moves and
-/// resizes in the same operation, so there is no intermediate rectangle at
-/// all to worry about -- the window goes straight from `from` to `target`,
-/// which trivially satisfies the guarantee above (nothing occupies a
-/// rectangle outside the work area in between, because there is no in
-/// between). It also means one `WM_WINDOWPOSCHANGED` instead of up to three
-/// separate resize/move messages, which is what was showing up as a visible
-/// flash/jump on a transparent, shadowless window: each of Tauri's own
-/// `set_size`/`set_position` is its own `SetWindowPos` call underneath, and
-/// WebView2's transparency compositing does not always keep up with a rapid
-/// sequence of them.
+/// On Windows this instead animates smoothly from `from` to `target` over a
+/// handful of `SetWindowPos` calls (position and size together, each frame),
+/// rather than either Tauri's separate `set_position`/`set_size` (each its
+/// own `SetWindowPos` underneath - the original source of the flash, two
+/// separate resize/move messages that WebView2's transparency compositing
+/// did not keep up with) or a single instant jump to `target` (which fixed
+/// the flash but still read as a hard cut, not a resize). Every animated
+/// frame is a real rectangle on the path from `from` to `target` - since
+/// both are themselves valid (already-placed) rectangles and every frame is
+/// a per-axis interpolation between them, nothing in between can be further
+/// outside the work area than the worse of the two ends, so this satisfies
+/// the guarantee above the same way the single-call version did, just
+/// spread over more than one call.
 ///
 /// Elsewhere (no `HWND` to be had, e.g. any other platform) falls back to the
-/// three-step dance this function used to always do:
+/// three-step dance this function used to always do, unanimated:
 ///
 /// The naive version picks an order -- size then move, or move then size --
 /// from whether the window is growing. That works only while one bool can
@@ -296,20 +298,20 @@ pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
 /// message rather than three.
 pub fn move_into<R: Runtime>(
   window: &Window<R>,
-  from: PhysicalSize<u32>,
+  from: Rect,
   target: Rect,
 ) -> Result<(), String> {
   #[cfg(windows)]
   if let Ok(hwnd) = window.hwnd() {
-    return set_window_pos(hwnd, target).map_err(|error| error.to_string());
+    return animate_window_pos(hwnd, from, target).map_err(|error| error.to_string());
   }
 
   let waypoint = PhysicalSize::new(
-    from.width.min(target.size.width),
-    from.height.min(target.size.height),
+    from.size.width.min(target.size.width),
+    from.size.height.min(target.size.height),
   );
 
-  if waypoint != from {
+  if waypoint != from.size {
     window.set_size(waypoint).map_err(|error| error.to_string())?;
   }
   window
@@ -324,35 +326,80 @@ pub fn move_into<R: Runtime>(
   Ok(())
 }
 
-/// The Windows fast path for [`move_into`]: one `SetWindowPos` call carrying
-/// both the new position and size, rather than Tauri's separate
-/// `set_position`/`set_size` (each its own `SetWindowPos` underneath).
-///
-/// `SWP_NOZORDER | SWP_NOACTIVATE` keep this a pure geometry change - no
-/// z-order or focus side effects, matching what `set_size`/`set_position`
-/// each already leave alone. `SWP_ASYNCWINDOWPOS` posts the request rather
-/// than blocking for the target window's thread to process it, consistent
-/// with this plugin already doing its placement work off the main thread.
+/// How long the Windows resize animation in [`animate_window_pos`] takes, and
+/// how many frames it is spread over. ~150ms reads as a deliberate motion
+/// without feeling laggy; 60fps pacing (`ANIMATION_FRAME_MS`) matches typical
+/// display refresh so each step actually gets painted rather than some being
+/// coalesced away.
 #[cfg(windows)]
-fn set_window_pos(
+const ANIMATION_STEPS: u32 = 9;
+#[cfg(windows)]
+const ANIMATION_FRAME_MS: u64 = 16;
+
+/// The Windows path for [`move_into`]: animates from `from` to `target` in
+/// [`ANIMATION_STEPS`] frames of a single `SetWindowPos` call each (position
+/// and size together - see the module-level note on why combining them
+/// matters), easing out so the motion settles rather than stopping abruptly.
+///
+/// `SWP_NOZORDER | SWP_NOACTIVATE` keep every frame a pure geometry change -
+/// no z-order or focus side effects, matching what `set_size`/`set_position`
+/// each already leave alone. `SWP_ASYNCWINDOWPOS` posts each frame's request
+/// rather than blocking for the target window's thread to process it,
+/// consistent with this plugin already doing its placement work off the main
+/// thread - see the comment on `set_state` in commands.rs for why that
+/// matters here specifically (a blocking call on the wrong thread hung the
+/// process before).
+#[cfg(windows)]
+fn animate_window_pos(
   hwnd: windows::Win32::Foundation::HWND,
+  from: Rect,
   target: Rect,
 ) -> windows::core::Result<()> {
   use windows::Win32::UI::WindowsAndMessaging::{
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
   };
 
-  unsafe {
-    SetWindowPos(
-      hwnd,
-      None,
-      target.position.x,
-      target.position.y,
-      target.size.width as i32,
-      target.size.height as i32,
-      SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
-    )
+  fn lerp_i32(from: i32, to: i32, t: f64) -> i32 {
+    (from as f64 + (to - from) as f64 * t).round() as i32
   }
+
+  fn lerp_u32(from: u32, to: u32, t: f64) -> u32 {
+    (from as f64 + (to as f64 - from as f64) * t).round() as u32
+  }
+
+  // Fast start, slow finish - reads as the window settling into place rather
+  // than the linear alternative, which looks like it stops on a dime.
+  fn ease_out(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
+  }
+
+  for step in 1..=ANIMATION_STEPS {
+    // t reaches exactly 1.0 on the last step (ease_out(1.0) == 1.0), so the
+    // final frame lands exactly on `target` - no rounding drift left behind.
+    let t = ease_out(f64::from(step) / f64::from(ANIMATION_STEPS));
+    let x = lerp_i32(from.position.x, target.position.x, t);
+    let y = lerp_i32(from.position.y, target.position.y, t);
+    let width = lerp_u32(from.size.width, target.size.width, t);
+    let height = lerp_u32(from.size.height, target.size.height, t);
+
+    unsafe {
+      SetWindowPos(
+        hwnd,
+        None,
+        x,
+        y,
+        width as i32,
+        height as i32,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+      )?;
+    }
+
+    if step < ANIMATION_STEPS {
+      std::thread::sleep(std::time::Duration::from_millis(ANIMATION_FRAME_MS));
+    }
+  }
+
+  Ok(())
 }
 
 #[cfg(test)]
