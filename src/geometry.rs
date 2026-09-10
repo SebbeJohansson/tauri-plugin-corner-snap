@@ -254,9 +254,24 @@ pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
 /// Moves and resizes a window into `target` without it ever occupying a
 /// rectangle outside the work area.
 ///
-/// That guarantee is the whole point of the three steps, and it is not
-/// negotiable: moving a transparent, always-on-top window off the edge of the
-/// screen is what took the process down.
+/// That guarantee is the whole point of the fallback's three steps below, and
+/// it is not negotiable: moving a transparent, always-on-top window off the
+/// edge of the screen is what took the process down.
+///
+/// On Windows this is one native call instead: `SetWindowPos` moves and
+/// resizes in the same operation, so there is no intermediate rectangle at
+/// all to worry about -- the window goes straight from `from` to `target`,
+/// which trivially satisfies the guarantee above (nothing occupies a
+/// rectangle outside the work area in between, because there is no in
+/// between). It also means one `WM_WINDOWPOSCHANGED` instead of up to three
+/// separate resize/move messages, which is what was showing up as a visible
+/// flash/jump on a transparent, shadowless window: each of Tauri's own
+/// `set_size`/`set_position` is its own `SetWindowPos` call underneath, and
+/// WebView2's transparency compositing does not always keep up with a rapid
+/// sequence of them.
+///
+/// Elsewhere (no `HWND` to be had, e.g. any other platform) falls back to the
+/// three-step dance this function used to always do:
 ///
 /// The naive version picks an order -- size then move, or move then size --
 /// from whether the window is growing. That works only while one bool can
@@ -283,21 +298,61 @@ pub fn move_into<R: Runtime>(
   window: &Window<R>,
   from: PhysicalSize<u32>,
   target: Rect,
-) -> tauri::Result<()> {
+) -> Result<(), String> {
+  #[cfg(windows)]
+  if let Ok(hwnd) = window.hwnd() {
+    return set_window_pos(hwnd, target).map_err(|error| error.to_string());
+  }
+
   let waypoint = PhysicalSize::new(
     from.width.min(target.size.width),
     from.height.min(target.size.height),
   );
 
   if waypoint != from {
-    window.set_size(waypoint)?;
+    window.set_size(waypoint).map_err(|error| error.to_string())?;
   }
-  window.set_position(target.position)?;
+  window
+    .set_position(target.position)
+    .map_err(|error| error.to_string())?;
   if target.size != waypoint {
-    window.set_size(target.size)?;
+    window
+      .set_size(target.size)
+      .map_err(|error| error.to_string())?;
   }
 
   Ok(())
+}
+
+/// The Windows fast path for [`move_into`]: one `SetWindowPos` call carrying
+/// both the new position and size, rather than Tauri's separate
+/// `set_position`/`set_size` (each its own `SetWindowPos` underneath).
+///
+/// `SWP_NOZORDER | SWP_NOACTIVATE` keep this a pure geometry change - no
+/// z-order or focus side effects, matching what `set_size`/`set_position`
+/// each already leave alone. `SWP_ASYNCWINDOWPOS` posts the request rather
+/// than blocking for the target window's thread to process it, consistent
+/// with this plugin already doing its placement work off the main thread.
+#[cfg(windows)]
+fn set_window_pos(
+  hwnd: windows::Win32::Foundation::HWND,
+  target: Rect,
+) -> windows::core::Result<()> {
+  use windows::Win32::UI::WindowsAndMessaging::{
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+  };
+
+  unsafe {
+    SetWindowPos(
+      hwnd,
+      None,
+      target.position.x,
+      target.position.y,
+      target.size.width as i32,
+      target.size.height as i32,
+      SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+    )
+  }
 }
 
 #[cfg(test)]

@@ -343,8 +343,7 @@ pub(crate) fn reposition<R: Runtime>(
   );
 
   *last_attempt = Some((current, slot.rect));
-  geometry::move_into(window, current.size, slot.rect)
-    .map_err(|error| error.to_string())?;
+  geometry::move_into(window, current.size, slot.rect)?;
 
   // Announced only once the window is actually there, so a listener that reads
   // the window's position when it hears this sees the placement it was told
