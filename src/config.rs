@@ -248,6 +248,19 @@ pub struct Config {
   /// window.
   #[serde(rename = "placementCheckMs", deserialize_with = "millis")]
   pub placement_check: Duration,
+  /// Whether a window follows the main screen when the main screen changes.
+  ///
+  /// A widget lives on the screen its owner is looking at, and plugging in an
+  /// external monitor moves that screen without moving the widget: it is left
+  /// parked in the corner of a display that is now off to one side, or behind a
+  /// closed lid. With this on, a change of main screen carries every managed
+  /// window over to the new one, into the slot it was already in.
+  ///
+  /// It applies to a *change* only, so dragging a widget onto the second
+  /// monitor still leaves it there for as long as the displays stay as they
+  /// are. Turn it off for a window that should sit on whichever screen it was
+  /// last put on whatever happens.
+  pub follow_primary: bool,
   /// Which windows to manage.
   pub manage: Manage,
   /// Per-window overrides of the placement settings that apply once, keyed by
@@ -265,6 +278,7 @@ impl Default for Config {
       edge_margin: 16,
       snap_delay: Duration::from_millis(250),
       placement_check: Duration::from_secs(10),
+      follow_primary: true,
       manage: Manage::All,
       windows: HashMap::new(),
     }

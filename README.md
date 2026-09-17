@@ -5,7 +5,8 @@ Keeps a Tauri window parked against an edge or corner of the screen.
 Drag the window anywhere and it slides back to whichever slot it was dropped
 nearest. It re-parks itself when it changes between its named states, when the
 work area changes (the taskbar moving, for instance), and when a monitor is
-plugged in or pulled out.
+plugged in or pulled out. Plug an external monitor into a laptop and the window
+[follows the main screen](#changing-screens) over to it.
 
 A window can also **change shape** depending on where it lands: a 260x90 panel
 in the corners, a 90px bar running the full height of the screen when dragged to
@@ -151,6 +152,38 @@ Two things worth knowing:
   matters. `verticalSize: [90, 320]` with `fill: true` uses the `90` and ignores
   the `320`.
 
+## Changing screens
+
+A widget lives on the screen its owner is looking at. Plugging an external
+monitor into a laptop moves that screen without moving the widget, which leaves
+it parked in the corner of a display that is now off to one side, or behind a
+closed lid.
+
+So when the main screen changes, every managed window is carried over to the new
+one — into the **slot it was already in**, at the size that slot has on the new
+screen. A widget in the bottom-right of the laptop panel comes back in the
+bottom-right of the external monitor, resized for its work area and its DPI.
+
+Two details this leans on:
+
+- The slot is kept rather than re-measured. Where the window sits says nothing
+  about where it belongs on a screen it is not on yet: its centre is in the old
+  monitor's coordinates, and the slot nearest that is whichever edge of the new
+  screen happens to face it.
+- Sizes are worked out from the **new** monitor's scale factor, not the window's.
+  A window being moved still reports the DPI of the screen it is leaving, and a
+  260x90 widget worked out from that is the wrong number of pixels on a screen
+  at a different scale.
+
+This applies to a *change* of main screen only, so dragging a widget onto the
+second monitor still leaves it there for as long as the displays stay as they
+are. `"followPrimary": false` turns it off, for a window that should sit on
+whichever screen it was last put on whatever happens.
+
+Rearranging the displays counts as a change too: a monitor that keeps its name
+but moves or changes resolution is a different work area, and the window is
+re-parked against it.
+
 ## Config
 
 Every key is optional; a block naming nothing but `states` is complete. Unknown
@@ -166,6 +199,7 @@ quietly doing nothing.
 | `edgeMargin` | `16` | Gap from the work area edge, in physical pixels. |
 | `snapDelayMs` | `250` | How long the window must sit still before a drag counts as finished. |
 | `placementCheckMs` | `10000` | Backstop re-check interval. |
+| `followPrimary` | `true` | Carry the window to the main screen when the main screen changes. |
 | `manage` | `"all"` | `"all"`, or `{ "labels": ["main"] }`. |
 | `windows` | `{}` | Per-label overrides of `initialState` and `initialAnchor`. |
 
@@ -307,6 +341,20 @@ On Windows the plugin also subclasses the window to catch `WM_DISPLAYCHANGE` and
 `WM_SETTINGCHANGE`/`SPI_SETWORKAREA`, because neither Tauri nor the window layer
 beneath it reports a monitor appearing or disappearing. Elsewhere the periodic
 check is the only mechanism, which is why it exists.
+
+Whether the *main screen* changed is worked out separately, by fingerprinting it
+— name, position, size — and comparing that against the one the window was last
+placed on. Nothing in this stack hands out a stable identifier for a display, so
+those three stand in for one. Doing it that way rather than from the Windows
+message means the check costs nothing on the platforms that have no such message:
+the periodic check notices there too, just later.
+
+A window crossing between two screens is moved in one step rather than animated.
+Every frame of the slide is a rectangle somewhere between the two ends, and
+between two monitors that is not necessarily on either of them — two screens of
+different heights, or with a gap in the desktop coordinate space, leave dead
+space a sliding window would cross, which is exactly what the guarantee below
+exists to prevent.
 
 Moving a transparent, always-on-top window off the edge of the screen took the
 process down once, so a window is never allowed to occupy a rectangle outside

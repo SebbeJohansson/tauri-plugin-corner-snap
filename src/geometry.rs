@@ -157,15 +157,82 @@ pub struct Slot {
   pub rect: Rect,
 }
 
+/// Which screen a placement is measured against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+  /// The one the window is already on. What a drag, a state change and the
+  /// periodic check all use, so a window carried over to the second monitor
+  /// stays there.
+  Current,
+  /// The main screen, wherever the window happens to be. Used only when the
+  /// main screen has changed underneath the window: there, staying where it is
+  /// means staying on the screen the user has just stopped looking at.
+  Primary,
+}
+
+/// Enough of a monitor to tell it from a different one.
+///
+/// Nothing in this stack hands out a stable identifier for a display, so the
+/// name the operating system gives it stands in for one, with its position and
+/// size alongside because the name is not always there and is not always
+/// unique. Plugging a monitor in, making another one the main screen, or
+/// rearranging the two changes at least one of the three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenId {
+  name: Option<String>,
+  position: PhysicalPosition<i32>,
+  size: PhysicalSize<u32>,
+}
+
+impl ScreenId {
+  pub fn of(monitor: &Monitor) -> Self {
+    ScreenId {
+      name: monitor.name().cloned(),
+      position: *monitor.position(),
+      size: *monitor.size(),
+    }
+  }
+
+  /// One built by hand. No monitor can be had in a test -- under WSLg none are
+  /// reported even at runtime -- so the comparison is exercised on values
+  /// rather than on displays.
+  #[cfg(test)]
+  pub(crate) fn describing(name: &str, position: (i32, i32), size: (u32, u32)) -> Self {
+    ScreenId {
+      name: Some(name.to_string()),
+      position: PhysicalPosition::new(position.0, position.1),
+      size: PhysicalSize::new(size.0, size.1),
+    }
+  }
+}
+
+/// The main screen right now, or `None` if nothing reports one.
+pub fn primary_screen<R: Runtime>(window: &Window<R>) -> Option<ScreenId> {
+  window
+    .primary_monitor()
+    .ok()
+    .flatten()
+    .map(|monitor| ScreenId::of(&monitor))
+}
+
 /// Finds a monitor to work against, trying the most specific source first.
+///
+/// `screen` decides which of the two the window is measured against; whichever
+/// it is, the other one is the first fallback, because a wrong screen still
+/// places the window somewhere it can be seen and no screen at all does not.
 ///
 /// A hidden window often has no `current_monitor` yet, and under WSLg none of
 /// these report anything at all, so every step can legitimately come back empty.
-pub fn pick_monitor<R: Runtime>(window: &Window<R>) -> Option<Monitor> {
-  if let Ok(Some(monitor)) = window.current_monitor() {
+pub fn pick_monitor<R: Runtime>(window: &Window<R>, screen: Screen) -> Option<Monitor> {
+  let (first, second) = match screen {
+    Screen::Current => (window.current_monitor(), window.primary_monitor()),
+    Screen::Primary => (window.primary_monitor(), window.current_monitor()),
+  };
+
+  if let Ok(Some(monitor)) = first {
     return Some(monitor);
   }
-  if let Ok(Some(monitor)) = window.primary_monitor() {
+  if let Ok(Some(monitor)) = second {
     return Some(monitor);
   }
   window
@@ -251,6 +318,23 @@ pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
   })
 }
 
+/// How a window travels to where it belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+  /// Slide there over a handful of frames.
+  Slide,
+  /// Go there in one step, with nothing drawn in between.
+  ///
+  /// For a move between two screens. Every frame of a slide is a rectangle
+  /// somewhere between the two ends, and between two monitors that is not
+  /// necessarily on either of them: two screens of different heights, or side
+  /// by side with a gap in the desktop coordinate space, leave dead space that
+  /// a sliding window would cross. The one guarantee this module makes is that
+  /// a window never occupies a rectangle outside the work area, so a move that
+  /// cannot honour it frame by frame does not get frames.
+  Jump,
+}
+
 /// Moves and resizes a window into `target` without it ever occupying a
 /// rectangle outside the work area.
 ///
@@ -300,11 +384,19 @@ pub fn move_into<R: Runtime>(
   window: &Window<R>,
   from: Rect,
   target: Rect,
+  motion: Motion,
 ) -> Result<(), String> {
   #[cfg(windows)]
   if let Ok(hwnd) = window.hwnd() {
-    return animate_window_pos(hwnd, from, target).map_err(|error| error.to_string());
+    return animate_window_pos(hwnd, from, target, motion)
+      .map_err(|error| error.to_string());
   }
+
+  // The fallback below honours `motion` by construction: its three steps are
+  // the shrink, the move and the grow, so the window is never drawn part of
+  // the way between the two positions whichever motion was asked for.
+  #[cfg(not(windows))]
+  let _ = motion;
 
   let waypoint = PhysicalSize::new(
     from.size.width.min(target.size.width),
@@ -349,11 +441,16 @@ const ANIMATION_FRAME_MS: u64 = 16;
 /// thread - see the comment on `set_state` in commands.rs for why that
 /// matters here specifically (a blocking call on the wrong thread hung the
 /// process before).
+///
+/// A [`Motion::Jump`] is the same path in a single frame: `ease_out(1.0)` is
+/// exactly 1.0, so the one frame lands on `target` and nothing is drawn between
+/// the two screens.
 #[cfg(windows)]
 fn animate_window_pos(
   hwnd: windows::Win32::Foundation::HWND,
   from: Rect,
   target: Rect,
+  motion: Motion,
 ) -> windows::core::Result<()> {
   use windows::Win32::UI::WindowsAndMessaging::{
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
@@ -373,10 +470,15 @@ fn animate_window_pos(
     1.0 - (1.0 - t).powi(3)
   }
 
-  for step in 1..=ANIMATION_STEPS {
+  let steps = match motion {
+    Motion::Slide => ANIMATION_STEPS,
+    Motion::Jump => 1,
+  };
+
+  for step in 1..=steps {
     // t reaches exactly 1.0 on the last step (ease_out(1.0) == 1.0), so the
     // final frame lands exactly on `target` - no rounding drift left behind.
-    let t = ease_out(f64::from(step) / f64::from(ANIMATION_STEPS));
+    let t = ease_out(f64::from(step) / f64::from(steps));
     let x = lerp_i32(from.position.x, target.position.x, t);
     let y = lerp_i32(from.position.y, target.position.y, t);
     let width = lerp_u32(from.size.width, target.size.width, t);
@@ -394,7 +496,7 @@ fn animate_window_pos(
       )?;
     }
 
-    if step < ANIMATION_STEPS {
+    if step < steps {
       std::thread::sleep(std::time::Duration::from_millis(ANIMATION_FRAME_MS));
     }
   }

@@ -5,6 +5,11 @@
 //! between named states, when the work area changes (the taskbar moving, for
 //! instance), and when a monitor is plugged in or pulled out.
 //!
+//! When the *main* screen changes -- an external monitor being plugged into a
+//! laptop, say -- the window goes with it, into the slot it was already in and
+//! at the size that slot has on the new screen. Set `followPrimary` to `false`
+//! for a window that should stay on whichever screen it was last put on.
+//!
 //! There are nine slots -- four corners, the middle of each edge, and the
 //! centre -- but only the four corners are offered by default, so a config
 //! written before edge slots existed behaves exactly as it did.
@@ -87,7 +92,10 @@ use tauri::{LogicalSize, Manager, PhysicalSize, Runtime, Window, WindowEvent};
 use config::WindowState as State;
 #[cfg(test)]
 use geometry::CORNERS;
-use geometry::{anchor_position, nearest, pick_monitor, window_rect, Area, Rect, Slot};
+use geometry::{
+  anchor_position, nearest, pick_monitor, primary_screen, window_rect, Area, Motion,
+  Rect, Screen, ScreenId, Slot,
+};
 use report::Reporter;
 use watcher::Watcher;
 
@@ -121,6 +129,9 @@ pub(crate) struct Inner {
 pub(crate) struct Tracked {
   reporter: Reporter,
   state: Arc<Mutex<Option<String>>>,
+  /// The main screen as it was when this window was last placed, so that a
+  /// different one can be recognised as a change rather than a fact.
+  screen: Arc<Mutex<Option<ScreenId>>>,
 }
 
 impl Tracked {
@@ -142,6 +153,24 @@ impl Tracked {
       .state
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.to_string());
+  }
+
+  /// Records which screen is the main one and says whether it is a different
+  /// one than the last time this window was placed.
+  ///
+  /// The first call has nothing to compare against, so it records and answers
+  /// no: a window being placed for the first time has not been left behind by
+  /// anything. Every later call is what notices a monitor being plugged in,
+  /// pulled out, or promoted to main.
+  pub(crate) fn note_screen(&self, screen: ScreenId) -> bool {
+    let mut last = self
+      .screen
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let changed = matches!(&*last, Some(known) if *known != screen);
+    *last = Some(screen);
+    changed
   }
 }
 
@@ -219,6 +248,26 @@ fn candidate_slots(
     .collect()
 }
 
+/// The screen a placement is measured against, given whether the window is
+/// following a change of main screen.
+fn screen_for(followed: bool) -> Screen {
+  if followed {
+    Screen::Primary
+  } else {
+    Screen::Current
+  }
+}
+
+/// How the window travels there. A move between two screens is not animated;
+/// see [`Motion::Jump`].
+fn motion_for(followed: bool) -> Motion {
+  if followed {
+    Motion::Jump
+  } else {
+    Motion::Slide
+  }
+}
+
 /// Puts a window where it belongs: the right slot, at the right size.
 ///
 /// The one path for all of it -- the initial placement, `set_state`, `snap`,
@@ -228,9 +277,11 @@ fn candidate_slots(
 /// chosen.
 ///
 /// `anchor_override` wins over the state's own `anchor`, which in turn wins over
-/// the nearest slot. An explicit anchor from either is honoured whether or not
-/// it appears in `snapTo`: that list restricts where a *drag* can put the
-/// window, and a configured anchor is a direct instruction.
+/// the slot the window is already in when it is following a change of main
+/// screen, which in turn wins over the nearest slot. An explicit anchor from
+/// either of the first two is honoured whether or not it appears in `snapTo`:
+/// that list restricts where a *drag* can put the window, and a configured
+/// anchor is a direct instruction.
 ///
 /// `last_attempt` remembers the (before, after) rectangles of the previous move
 /// so a window that cannot be moved is not chased forever; pass `&mut None` for
@@ -261,7 +312,26 @@ pub(crate) fn reposition<R: Runtime>(
   let name = tracked.state();
   let state = name.as_deref().and_then(|name| config.states.get(name));
 
-  let Some(monitor) = pick_monitor(window) else {
+  // Whether the main screen has changed since this window was last placed.
+  // Asked before a monitor is picked, because the answer is what decides which
+  // monitor that is: a widget belongs on the screen its owner is looking at, and
+  // plugging in an external display moves that screen without moving the widget.
+  //
+  // Recorded on the way past whether or not it is followed, so turning
+  // `followPrimary` off leaves nothing accumulating to act on later.
+  let screen_changed =
+    primary_screen(window).is_some_and(|screen| tracked.note_screen(screen));
+  let followed = screen_changed && config.follow_primary;
+
+  if screen_changed && !config.follow_primary {
+    log::debug!(
+      "corner-snap: the main screen changed; leaving {} where it is \
+       (followPrimary is off)",
+      window.label()
+    );
+  }
+
+  let Some(monitor) = pick_monitor(window, screen_for(followed)) else {
     // Logged quietly: the placement check runs on a timer, and under WSLg this
     // is the normal answer every time.
     log::debug!("corner-snap: no monitor reported; cannot place the window");
@@ -280,14 +350,26 @@ pub(crate) fn reposition<R: Runtime>(
   };
 
   let area = Area::of(&monitor);
-  let scale = window.scale_factor().map_err(|error| error.to_string())?;
+  let scale = monitor.scale_factor();
   let current = window_rect(window).map_err(|error| error.to_string())?;
+
+  // Where the window is now says nothing about where it belongs on a screen it
+  // is not on yet: its centre is in the other monitor's coordinates, and the
+  // slot nearest that is whichever edge of the new screen happens to face it.
+  // So a window carried to a new main screen keeps the slot it was already in,
+  // and only falls back to the nearest one if it has never been placed.
+  let held = followed
+    .then(|| tracked.reporter.last().map(|placement| placement.anchor))
+    .flatten();
 
   // The slot is resolved from where the window is *now*, before anything is
   // resized. Measured afterwards, a window that grew in a corner overhangs the
   // screen edge, and its centre can land on the neighbouring monitor, which
   // would send it to that screen instead.
-  let slot = match anchor_override.or_else(|| state.and_then(|state| state.anchor)) {
+  let slot = match anchor_override
+    .or_else(|| state.and_then(|state| state.anchor))
+    .or(held)
+  {
     Some(anchor) => slot_at(anchor, config, state, &area, scale, current.size),
     None => {
       let candidates = candidate_slots(config, state, &area, scale, current.size);
@@ -333,17 +415,18 @@ pub(crate) fn reposition<R: Runtime>(
   }
 
   log::debug!(
-    "corner-snap: {} -> {:?} {}x{} at {},{}",
+    "corner-snap: {} -> {:?} {}x{} at {},{}{}",
     name.as_deref().unwrap_or("(no state)"),
     slot.anchor,
     slot.rect.size.width,
     slot.rect.size.height,
     slot.rect.position.x,
     slot.rect.position.y,
+    if followed { " (new main screen)" } else { "" },
   );
 
   *last_attempt = Some((current, slot.rect));
-  geometry::move_into(window, current, slot.rect)?;
+  geometry::move_into(window, current, slot.rect, motion_for(followed))?;
 
   // Announced only once the window is actually there, so a listener that reads
   // the window's position when it hears this sees the placement it was told
@@ -368,9 +451,11 @@ pub(crate) fn measure<R: Runtime>(
     return None;
   }
 
-  let monitor = pick_monitor(window)?;
+  // Always the screen the window is on: this reports where the window *is*,
+  // and moving it to a new main screen is `reposition`'s job.
+  let monitor = pick_monitor(window, Screen::Current)?;
   let area = Area::of(&monitor);
-  let scale = window.scale_factor().ok()?;
+  let scale = monitor.scale_factor();
   let current = window_rect(window).ok()?;
 
   let name = tracked.state();
@@ -773,6 +858,63 @@ mod tests {
       (1980, 720),
     );
     assert_eq!(Orientation::of(badge.rect.size), Orientation::Horizontal);
+  }
+
+  fn laptop() -> ScreenId {
+    ScreenId::describing(r"\\.\DISPLAY1", (0, 0), (1920, 1080))
+  }
+
+  fn external() -> ScreenId {
+    ScreenId::describing(r"\\.\DISPLAY2", (0, 0), (3840, 2160))
+  }
+
+  /// The first look has nothing to compare against, so a window being placed
+  /// for the first time is not treated as having been left behind.
+  #[test]
+  fn the_screen_a_window_opens_on_is_not_a_change() {
+    let tracked = Tracked::default();
+
+    assert!(!tracked.note_screen(laptop()));
+    assert!(!tracked.note_screen(laptop()));
+  }
+
+  /// The whole point: a different main screen is noticed once, and the look
+  /// after it is not a second change, so the window is carried over rather than
+  /// re-placed on every tick from then on.
+  #[test]
+  fn a_new_main_screen_is_a_change_once() {
+    let tracked = Tracked::default();
+    tracked.note_screen(laptop());
+
+    assert!(tracked.note_screen(external()));
+    assert!(!tracked.note_screen(external()));
+
+    // And back again when the external monitor is unplugged.
+    assert!(tracked.note_screen(laptop()));
+  }
+
+  /// A monitor keeping its name while changing size or place is still a change:
+  /// the work area the slots are measured against is a different rectangle, and
+  /// on Windows the display name is a slot number that gets reused.
+  #[test]
+  fn the_same_screen_rearranged_is_a_change_too() {
+    let tracked = Tracked::default();
+    tracked.note_screen(laptop());
+
+    assert!(tracked.note_screen(ScreenId::describing(
+      r"\\.\DISPLAY1",
+      (-1920, 0),
+      (1920, 1080)
+    )));
+  }
+
+  /// Following is on unless the config says otherwise, and turning it off is
+  /// what a window that should stay on the screen it was last put on needs.
+  #[test]
+  fn windows_follow_the_main_screen_unless_told_not_to() {
+    assert!(Config::default().follow_primary);
+    assert!(config(r#"{ "states": {} }"#).follow_primary);
+    assert!(!config(r#"{ "followPrimary": false }"#).follow_primary);
   }
 
   /// A widget that should hug an edge with no gap at all: the case
