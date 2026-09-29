@@ -297,15 +297,23 @@ fn place_axis(
 /// pixels from the `topRight` centre and several hundred from the full-height
 /// `right` one.
 ///
-/// Ties go to whichever slot comes first in `slots`.
-pub fn nearest(centre: PhysicalPosition<i32>, slots: &[Slot]) -> Option<Slot> {
+/// Ties go to `prefer` -- the slot the window was last in -- and failing that
+/// to whichever slot comes first in `slots`. Ties are not a corner case: a
+/// state that fills both ways lands on the same rectangle, the whole work area,
+/// from every edge, so without the preference a bottom-docked window that grows
+/// into it would jump to whichever edge `snapTo` happens to list first.
+pub fn nearest(
+  centre: PhysicalPosition<i32>,
+  slots: &[Slot],
+  prefer: Option<Anchor>,
+) -> Option<Slot> {
   slots
     .iter()
     .min_by_key(|slot| {
       let slot_centre = slot.rect.centre();
       let dx = (slot_centre.x - centre.x) as i64;
       let dy = (slot_centre.y - centre.y) as i64;
-      dx * dx + dy * dy
+      (dx * dx + dy * dy, Some(slot.anchor) != prefer)
     })
     .copied()
 }
@@ -594,7 +602,7 @@ mod tests {
       .map(|&anchor| slot(anchor, panel, 16))
       .collect();
 
-    let found = nearest(PhysicalPosition::new(180, 260), &slots).expect("a slot");
+    let found = nearest(PhysicalPosition::new(180, 260), &slots, None).expect("a slot");
     assert_eq!(found.anchor, Anchor::TopLeft);
   }
 
@@ -612,12 +620,12 @@ mod tests {
     slots.push(slot(Anchor::Right, bar, 16));
 
     // Right edge, halfway down.
-    let middle = nearest(PhysicalPosition::new(1980, 720), &slots).expect("a slot");
+    let middle = nearest(PhysicalPosition::new(1980, 720), &slots, None).expect("a slot");
     assert_eq!(middle.anchor, Anchor::Right);
     assert_eq!(middle.rect.size, bar);
 
     // Right edge, hard against the top.
-    let corner = nearest(PhysicalPosition::new(1980, 240), &slots).expect("a slot");
+    let corner = nearest(PhysicalPosition::new(1980, 240), &slots, None).expect("a slot");
     assert_eq!(corner.anchor, Anchor::TopRight);
     assert_eq!(corner.rect.size, panel);
   }
@@ -629,13 +637,32 @@ mod tests {
     let panel = PhysicalSize::new(260, 90);
     let slots = [slot(Anchor::BottomLeft, panel, 16)];
 
-    let found = nearest(PhysicalPosition::new(1980, 240), &slots).expect("a slot");
+    let found = nearest(PhysicalPosition::new(1980, 240), &slots, None).expect("a slot");
     assert_eq!(found.anchor, Anchor::BottomLeft);
   }
 
   #[test]
+  fn a_tie_goes_to_the_slot_the_window_was_in() {
+    let whole = Rect {
+      position: PhysicalPosition::new(0, 0),
+      size: PhysicalSize::new(2560, 1392),
+    };
+    let slots = [
+      Slot { anchor: Anchor::Top, rect: whole },
+      Slot { anchor: Anchor::Bottom, rect: whole },
+    ];
+    let centre = PhysicalPosition::new(1280, 1300);
+
+    assert_eq!(nearest(centre, &slots, None).map(|slot| slot.anchor), Some(Anchor::Top));
+    assert_eq!(
+      nearest(centre, &slots, Some(Anchor::Bottom)).map(|slot| slot.anchor),
+      Some(Anchor::Bottom)
+    );
+  }
+
+  #[test]
   fn nothing_is_nearest_to_no_slots() {
-    assert_eq!(nearest(PhysicalPosition::new(0, 0), &[]), None);
+    assert_eq!(nearest(PhysicalPosition::new(0, 0), &[], None), None);
   }
 
   #[test]

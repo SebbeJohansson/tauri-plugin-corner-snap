@@ -375,7 +375,8 @@ pub(crate) fn reposition<R: Runtime>(
       let candidates = candidate_slots(config, state, &area, scale, current.size);
       // `slots_for` never returns an empty list, so this is unreachable; it
       // costs one line to not panic if that ever stops being true.
-      nearest(current.centre(), &candidates)
+      let last = tracked.reporter.last().map(|placement| placement.anchor);
+      nearest(current.centre(), &candidates, last)
         .ok_or_else(|| "no slots to choose from".to_string())?
     }
   };
@@ -463,7 +464,12 @@ pub(crate) fn measure<R: Runtime>(
   let candidates = candidate_slots(config, state, &area, scale, current.size);
 
   Some(Placement {
-    anchor: nearest(current.centre(), &candidates)?.anchor,
+    anchor: nearest(
+      current.centre(),
+      &candidates,
+      tracked.reporter.last().map(|placement| placement.anchor),
+    )?
+    .anchor,
     // Measured from the window itself, not from the slot it is nearest: this
     // reports how the window *is*, and a window mid-drag has not turned yet.
     orientation: Orientation::of(current.size),
@@ -722,7 +728,7 @@ mod tests {
     let state = state.and_then(|name| config.states.get(name));
     let candidates = candidate_slots(config, state, &area(), 1.0, size);
 
-    nearest(PhysicalPosition::new(centre.0, centre.1), &candidates).expect("a slot")
+    nearest(PhysicalPosition::new(centre.0, centre.1), &candidates, None).expect("a slot")
   }
 
   fn rotating() -> Config {
