@@ -633,20 +633,21 @@ fn warn_about(config: &Config) {
       );
     }
 
-    if state.fill != Fill::None && !slots.iter().any(|slot| slot.is_side()) {
-      log::warn!(
-        "corner-snap: '{name}' has fill set but cannot reach an edge slot, so it \
-         will never stretch; fill applies to \"top\", \"right\", \"bottom\" and \
-         \"left\" only"
-      );
-    }
+    for (key, fill) in [("fill", state.fill), ("fillAcross", state.fill_across)] {
+      if fill != Fill::None && !slots.iter().any(|slot| slot.is_side()) {
+        log::warn!(
+          "corner-snap: '{name}' has {key} set but cannot reach an edge slot, so \
+           it will never stretch; {key} applies to \"top\", \"right\", \"bottom\" \
+           and \"left\" only"
+        );
+      }
 
-    if !state.fill.is_sensible() {
-      log::warn!(
-        "corner-snap: fill for '{name}' is {:?}; it must be true, false, or a \
-         fraction above 0 and up to 1, and has been clamped",
-        state.fill
-      );
+      if !fill.is_sensible() {
+        log::warn!(
+          "corner-snap: {key} for '{name}' is {fill:?}; it must be true, false, or \
+           a fraction above 0 and up to 1, and has been clamped"
+        );
+      }
     }
   }
 }

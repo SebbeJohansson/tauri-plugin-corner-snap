@@ -152,6 +152,27 @@ Two things worth knowing:
   matters. `verticalSize: [90, 320]` with `fill: true` uses the `90` and ignores
   the `320`.
 
+### Across the screen
+
+`fillAcross` is the same setting for the other axis: the height in `top` and
+`bottom`, the width in `left` and `right`. It takes the same values, applies in
+the same four slots, and is independent of `fill`.
+
+```json
+"overlay": {
+  "size": [2560, 390],
+  "verticalSize": [390, 2560],
+  "fill": true,
+  "fillAcross": true
+}
+```
+
+Both at `true` make the window exactly the work area, less `edgeMargin` all
+round. That suits a transparent window that draws its own panel against the
+docked edge and wants the rest of the screen free to lay things out in. Note
+that the operating system still hit-tests the transparent part: making it click
+through to what is behind is up to the app (`setIgnoreCursorEvents`).
+
 ## Changing screens
 
 A widget lives on the screen its owner is looking at. Plugging an external
@@ -203,13 +224,14 @@ quietly doing nothing.
 | `manage` | `"all"` | `"all"`, or `{ "labels": ["main"] }`. |
 | `windows` | `{}` | Per-label overrides of `initialState` and `initialAnchor`. |
 
-A state takes a size in logical pixels and four optional keys:
+A state takes a size in logical pixels and five optional keys:
 
 | Key | Default | What it does |
 | --- | --- | --- |
 | `size` | required | Size in logical pixels. |
 | `verticalSize` | `null` | Size in the `left`/`right` slots. Absent means the state never turns. |
 | `fill` | `false` | Stretch along the docked edge. `true`, `false`, or a fraction. |
+| `fillAcross` | `false` | Stretch away from the docked edge, across the screen. Same values as `fill`. |
 | `anchor` | `null` | Slot to move to every time the window enters this state. |
 | `snapTo` | inherits | Narrows the config's slot list for this state alone. |
 
@@ -370,5 +392,5 @@ does.
   is resized but not moved, and a warning is logged; run on a real desktop.
 - Snapping is to one of the nine slots. There is no free placement mode, and no
   way to snap to a slot's edge rather than its centre.
-- `fill` stretches along one axis only. A window cannot be told to fill a
-  quadrant, or the whole work area.
+- `fill` and `fillAcross` only apply in the four edge slots. A window in a
+  corner cannot be told to fill a quadrant.

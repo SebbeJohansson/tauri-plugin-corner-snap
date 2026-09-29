@@ -96,6 +96,18 @@ pub struct WindowState {
   /// thickness matters.
   #[serde(default)]
   pub fill: Fill,
+  /// Whether to stretch across the screen, away from the docked edge, and how
+  /// far: the height in the `top` and `bottom` slots, the width in `left` and
+  /// `right`.
+  ///
+  /// Takes the same values as `fill` and the same slots, and is independent of
+  /// it. Both at `true` make the window exactly the work area, less the margin
+  /// -- for a transparent overlay that draws its own panel against one edge
+  /// and wants the rest of the screen to lay things out in.
+  ///
+  /// While filling across, the declared thickness is unused.
+  #[serde(default)]
+  pub fill_across: Fill,
   /// Where to move when entering this state. `None` keeps the current anchor,
   /// so the window grows and shrinks in whichever slot the user left it in.
   #[serde(default)]
@@ -131,14 +143,28 @@ impl WindowState {
     let (width, height) = self.logical_size(anchor);
     let mut size: PhysicalSize<u32> = LogicalSize::new(width, height).to_physical(scale);
 
-    let Some(fraction) = self.fill.fraction().filter(|_| anchor.is_side()) else {
+    if !anchor.is_side() {
       return size;
-    };
+    }
 
-    if anchor.runs_vertically() {
-      size.height = stretch(area.size.height, fraction, edge_margin);
-    } else {
-      size.width = stretch(area.size.width, fraction, edge_margin);
+    // Along the edge is height on a side dock and width on a top or bottom
+    // one; across is the other of the two.
+    let vertical = anchor.runs_vertically();
+
+    if let Some(fraction) = self.fill.fraction() {
+      if vertical {
+        size.height = stretch(area.size.height, fraction, edge_margin);
+      } else {
+        size.width = stretch(area.size.width, fraction, edge_margin);
+      }
+    }
+
+    if let Some(fraction) = self.fill_across.fraction() {
+      if vertical {
+        size.width = stretch(area.size.width, fraction, edge_margin);
+      } else {
+        size.height = stretch(area.size.height, fraction, edge_margin);
+      }
     }
 
     size
@@ -364,6 +390,7 @@ mod tests {
     assert_eq!(config.states["expanded"].anchor, None);
     assert_eq!(config.states["expanded"].vertical_size, None);
     assert_eq!(config.states["expanded"].fill, Fill::None);
+    assert_eq!(config.states["expanded"].fill_across, Fill::None);
     assert_eq!(config.initial_state, None);
     assert_eq!(config.initial_anchor, None);
     assert_eq!(config.edge_margin, 16);
@@ -389,6 +416,7 @@ mod tests {
             "size": [260, 90],
             "verticalSize": [90, 320],
             "fill": true,
+            "fillAcross": 0.5,
             "anchor": "bottomRight"
           },
           "collapsed": { "size": [44, 44], "snapTo": ["top", "bottom"] }
@@ -407,6 +435,7 @@ mod tests {
     assert_eq!(expanded.anchor, Some(Anchor::BottomRight));
     assert_eq!(expanded.vertical_size, Some((90.0, 320.0)));
     assert_eq!(expanded.fill, Fill::Full);
+    assert_eq!(expanded.fill_across, Fill::Fraction(0.5));
     assert_eq!(config.states["collapsed"].size, (44.0, 44.0));
     assert_eq!(config.initial_state.as_deref(), Some("expanded"));
     assert_eq!(config.initial_anchor, Some(Anchor::TopLeft));
@@ -503,10 +532,55 @@ mod tests {
     assert_eq!(strip, PhysicalSize::new(1920 - 32, 90));
   }
 
+  #[test]
+  fn filling_across_stretches_away_from_the_edge() {
+    let state = state(
+      r#"{ "size": [260, 90], "verticalSize": [90, 320], "fillAcross": true }"#,
+    );
+
+    // Docked bottom: the height runs up the screen, the width is as declared.
+    assert_eq!(
+      state.physical_size(Anchor::Bottom, &area(), 1.0, 16),
+      PhysicalSize::new(260, 1040 - 32)
+    );
+    // Docked left: the width runs across the screen instead.
+    assert_eq!(
+      state.physical_size(Anchor::Left, &area(), 1.0, 16),
+      PhysicalSize::new(1920 - 32, 320)
+    );
+  }
+
+  /// The case the setting exists for: a transparent overlay the size of the
+  /// work area, whichever edge it is docked to.
+  #[test]
+  fn both_fills_together_cover_the_work_area() {
+    let state = state(
+      r#"{ "size": [260, 90], "verticalSize": [90, 320], "fill": true, "fillAcross": true }"#,
+    );
+
+    for anchor in [Anchor::Top, Anchor::Right, Anchor::Bottom, Anchor::Left] {
+      assert_eq!(
+        state.physical_size(anchor, &area(), 2.0, 0),
+        PhysicalSize::new(1920, 1040),
+        "{anchor:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_fraction_across_leaves_the_rest_of_the_screen_free() {
+    let state = state(r#"{ "size": [260, 90], "fill": true, "fillAcross": 0.5 }"#);
+
+    assert_eq!(
+      state.physical_size(Anchor::Bottom, &area(), 1.0, 0),
+      PhysicalSize::new(1920, 520)
+    );
+  }
+
   /// A corner touches two edges, so there is no single axis to stretch along.
   #[test]
   fn filling_does_nothing_in_a_corner_or_the_centre() {
-    let state = state(r#"{ "size": [260, 90], "fill": true }"#);
+    let state = state(r#"{ "size": [260, 90], "fill": true, "fillAcross": true }"#);
 
     assert_eq!(
       state.physical_size(Anchor::BottomRight, &area(), 1.0, 16),
