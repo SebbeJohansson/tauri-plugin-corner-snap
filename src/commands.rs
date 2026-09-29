@@ -50,7 +50,7 @@ pub(crate) fn set_state<R: Runtime>(
   std::thread::spawn(move || {
     // No anchor override: the state's own `anchor` decides, and failing that
     // the window stays in whichever slot the user left it in.
-    if let Err(error) = reposition(&window, &config, &tracked, None, &mut None) {
+    if let Err(error) = reposition(&window, &config, &tracked, None, false, &mut None) {
       log::error!("corner-snap: set_state({state:?}) failed: {error}");
     }
   });
@@ -72,7 +72,7 @@ pub(crate) fn snap<R: Runtime>(
   let tracked = shared.tracked(window.label());
 
   std::thread::spawn(move || {
-    if let Err(error) = reposition(&window, &config, &tracked, None, &mut None) {
+    if let Err(error) = reposition(&window, &config, &tracked, None, false, &mut None) {
       log::error!("corner-snap: snap failed: {error}");
     }
   });

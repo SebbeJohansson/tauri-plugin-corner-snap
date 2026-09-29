@@ -70,7 +70,7 @@ pub fn spawn<R: Runtime>(window: Window<R>, config: Config, tracked: Tracked) ->
       //
       // No anchor override: the whole point of this thread is to pick the slot
       // from where the window was dropped.
-      if let Err(error) = reposition(&window, &config, &tracked, None, &mut last_attempt)
+      if let Err(error) = reposition(&window, &config, &tracked, None, true, &mut last_attempt)
       {
         log::error!("corner-snap: could not place {label}: {error}");
       }

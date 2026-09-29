@@ -318,6 +318,28 @@ pub fn nearest(
     .copied()
 }
 
+/// The slot among `slots` whose point on the work area's boundary -- the middle
+/// of its edge, or the corner itself -- is nearest `point`.
+///
+/// For a drop that [`nearest`] cannot decide: a state that fills both ways is
+/// the whole work area from every edge, so the window's own rectangle says
+/// nothing about which edge it was dragged to. The cursor does.
+pub fn nearest_to_point(
+  point: PhysicalPosition<i32>,
+  area: &Area,
+  slots: &[Slot],
+) -> Option<Anchor> {
+  slots
+    .iter()
+    .map(|slot| slot.anchor)
+    .min_by_key(|&anchor| {
+      let spot = anchor_position(area, PhysicalSize::new(0, 0), anchor, 0);
+      let dx = (spot.x - point.x) as i64;
+      let dy = (spot.y - point.y) as i64;
+      dx * dx + dy * dy
+    })
+}
+
 /// Where the window is and how big it is, right now.
 pub fn window_rect<R: Runtime>(window: &Window<R>) -> tauri::Result<Rect> {
   Ok(Rect {
@@ -658,6 +680,26 @@ mod tests {
       nearest(centre, &slots, Some(Anchor::Bottom)).map(|slot| slot.anchor),
       Some(Anchor::Bottom)
     );
+  }
+
+  #[test]
+  fn the_cursor_picks_the_edge_when_every_slot_is_the_whole_screen() {
+    let area = Area {
+      position: PhysicalPosition::new(0, 0),
+      size: PhysicalSize::new(2560, 1392),
+    };
+    let whole = Rect {
+      position: area.position,
+      size: area.size,
+    };
+    let slots = [Anchor::Top, Anchor::Bottom, Anchor::Left, Anchor::Right]
+      .map(|anchor| Slot { anchor, rect: whole });
+
+    let at = |x, y| nearest_to_point(PhysicalPosition::new(x, y), &area, &slots);
+    assert_eq!(at(1280, 40), Some(Anchor::Top));
+    assert_eq!(at(1200, 1350), Some(Anchor::Bottom));
+    assert_eq!(at(30, 700), Some(Anchor::Left));
+    assert_eq!(at(2500, 600), Some(Anchor::Right));
   }
 
   #[test]

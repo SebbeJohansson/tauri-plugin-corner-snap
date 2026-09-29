@@ -87,13 +87,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::plugin::{Builder, TauriPlugin};
-use tauri::{LogicalSize, Manager, PhysicalSize, Runtime, Window, WindowEvent};
+use tauri::{LogicalSize, Manager, PhysicalPosition, PhysicalSize, Runtime, Window, WindowEvent};
 
 use config::WindowState as State;
 #[cfg(test)]
 use geometry::CORNERS;
 use geometry::{
-  anchor_position, nearest, pick_monitor, primary_screen, window_rect, Area, Motion,
+  anchor_position, nearest, nearest_to_point, pick_monitor, primary_screen, window_rect, Area, Motion,
   Rect, Screen, ScreenId, Slot,
 };
 use report::Reporter;
@@ -283,6 +283,12 @@ fn motion_for(followed: bool) -> Motion {
 /// that list restricts where a *drag* can put the window, and a configured
 /// anchor is a direct instruction.
 ///
+/// `dropped` says the call comes from a drag going quiet, so a window that is
+/// not where its last slot would put it was moved there by the user. When the
+/// slots cannot be told apart by the window's rectangle (see
+/// [`nearest_to_point`]), the cursor then picks the edge instead of the window
+/// staying put.
+///
 /// `last_attempt` remembers the (before, after) rectangles of the previous move
 /// so a window that cannot be moved is not chased forever; pass `&mut None` for
 /// a one-off request that should always try.
@@ -295,6 +301,7 @@ pub(crate) fn reposition<R: Runtime>(
   config: &Config,
   tracked: &Tracked,
   anchor_override: Option<Anchor>,
+  dropped: bool,
   last_attempt: &mut Option<(Rect, Rect)>,
 ) -> Result<Option<Placement>, String> {
   // A minimized window sits at a sentinel position far off every screen, and
@@ -376,7 +383,22 @@ pub(crate) fn reposition<R: Runtime>(
       // `slots_for` never returns an empty list, so this is unreachable; it
       // costs one line to not panic if that ever stops being true.
       let last = tracked.reporter.last().map(|placement| placement.anchor);
-      nearest(current.centre(), &candidates, last)
+      let parked = last
+        .and_then(|anchor| candidates.iter().find(|slot| slot.anchor == anchor))
+        .is_some_and(|slot| slot.rect == current);
+      let prefer = if dropped && !parked {
+        window
+          .cursor_position()
+          .ok()
+          .and_then(|cursor| {
+            let point = PhysicalPosition::new(cursor.x.round() as i32, cursor.y.round() as i32);
+            nearest_to_point(point, &area, &candidates)
+          })
+          .or(last)
+      } else {
+        last
+      };
+      nearest(current.centre(), &candidates, prefer)
         .ok_or_else(|| "no slots to choose from".to_string())?
     }
   };
@@ -496,7 +518,7 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
   let (initial_state, initial_anchor) = config.initial_for(&label);
   if let Some(state) = initial_state {
     tracked.set_state(state);
-    if let Err(error) = reposition(&window, config, &tracked, initial_anchor, &mut None) {
+    if let Err(error) = reposition(&window, config, &tracked, initial_anchor, false, &mut None) {
       log::error!("corner-snap: could not place {label}: {error}");
     }
   }
