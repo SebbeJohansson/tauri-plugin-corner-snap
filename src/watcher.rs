@@ -80,17 +80,23 @@ pub fn spawn<R: Runtime>(window: Window<R>, config: Config, tracked: Tracked) ->
   let (stop_ticker, stop_rx) = mpsc::channel::<()>();
   let ticker_moves = moves.clone();
   thread::spawn(move || loop {
+    // Waits before the first tick, not after. The watcher starts right behind
+    // the opening placement, whose moves on Windows are posted rather than
+    // applied (`SWP_ASYNCWINDOWPOS`) and land only once the event loop gets to
+    // them -- later still while the other windows are being created. A tick in
+    // that gap finds the window short of its slot, takes it for dropped, and
+    // lets the cursor pick the slot instead of `initialAnchor`.
+    match stop_rx.recv_timeout(placement_check) {
+      Err(RecvTimeoutError::Timeout) => {}
+      // Told to stop, or the handle was dropped.
+      _ => break,
+    }
     // Routed through the same channel as real moves, so it inherits the quiet
     // period: a tick that lands mid-drag waits for the drag to finish instead
     // of yanking the window out from under the cursor. When nothing has
     // changed the snap finds the window already parked and does nothing.
     if ticker_moves.send(()).is_err() {
       break;
-    }
-    match stop_rx.recv_timeout(placement_check) {
-      Err(RecvTimeoutError::Timeout) => {}
-      // Told to stop, or the handle was dropped.
-      _ => break,
     }
   });
 
