@@ -11,11 +11,16 @@ use crate::{measure, reposition, Placement, Shared};
 /// slot should give the window. Calling it on startup lets the window recover
 /// after a reload in development. An unknown name is an error, so a typo
 /// surfaces in the webview's `catch` instead of silently doing nothing.
+///
+/// `size`, in logical pixels, stands in for the state's own `size` until the
+/// next call: for a window that fits itself to what it draws. Leaving it out
+/// goes back to the configured size.
 #[tauri::command]
 pub(crate) fn set_state<R: Runtime>(
   window: Window<R>,
   shared: State<'_, Shared>,
   state: String,
+  size: Option<(f64, f64)>,
 ) -> Result<(), String> {
   let config = shared.config().clone();
   let tracked = shared.tracked(window.label());
@@ -31,7 +36,7 @@ pub(crate) fn set_state<R: Runtime>(
 
   // Recorded before the thread starts, so a second call landing while the first
   // is still working sees the newer state rather than racing it.
-  tracked.set_state(&state);
+  tracked.set_state(&state, size);
 
   // Moving the work to a thread is the point here, not an optimisation.
   //

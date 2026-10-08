@@ -287,6 +287,12 @@ import { invoke } from '@tauri-apps/api/core'
 // names one. An unknown name rejects, listing the names that do exist.
 await invoke('plugin:corner-snap|set_state', { state: 'collapsed' })
 
+// The same, at a size of the webview's choosing instead of the state's own
+// `size` (logical pixels). It holds until the next `set_state`, so a window can
+// fit itself to its content; leave `size` out to go back to the configured one.
+// `verticalSize`, `fill` and `fillAcross` still apply on top.
+await invoke('plugin:corner-snap|set_state', { state: 'expanded', size: [460, 120] })
+
 // Re-park now, without waiting for the periodic check.
 await invoke('plugin:corner-snap|snap')
 

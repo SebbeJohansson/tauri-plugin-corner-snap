@@ -129,6 +129,10 @@ pub(crate) struct Inner {
 pub(crate) struct Tracked {
   reporter: Reporter,
   state: Arc<Mutex<Option<String>>>,
+  /// A size the webview asked for in place of the state's own, in logical
+  /// pixels. Cleared by the next `set_state` that does not repeat it, so it
+  /// never outlives the call that set it into a different state.
+  size: Arc<Mutex<Option<(f64, f64)>>>,
   /// The main screen as it was when this window was last placed, so that a
   /// different one can be recognised as a change rather than a fact.
   screen: Arc<Mutex<Option<ScreenId>>>,
@@ -148,11 +152,33 @@ impl Tracked {
       .clone()
   }
 
-  pub(crate) fn set_state(&self, name: &str) {
+  pub(crate) fn set_state(&self, name: &str, size: Option<(f64, f64)>) {
     *self
       .state
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.to_string());
+    *self
+      .size
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
+  }
+
+  /// The state the window is in, with any size the webview asked for laid over
+  /// the configured one.
+  ///
+  /// The override replaces `size` only: `verticalSize`, `fill` and `fillAcross`
+  /// still apply, so a stretched axis stays stretched.
+  pub(crate) fn resolve(&self, config: &Config) -> Option<State> {
+    let name = self.state()?;
+    let mut state = config.states.get(&name)?.clone();
+    if let Some(size) = *self
+      .size
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+      state.size = size;
+    }
+    Some(state)
   }
 
   /// Records which screen is the main one and says whether it is a different
@@ -317,7 +343,8 @@ pub(crate) fn reposition<R: Runtime>(
   }
 
   let name = tracked.state();
-  let state = name.as_deref().and_then(|name| config.states.get(name));
+  let state = tracked.resolve(config);
+  let state = state.as_ref();
 
   // Whether the main screen has changed since this window was last placed.
   // Asked before a monitor is picked, because the answer is what decides which
@@ -481,8 +508,8 @@ pub(crate) fn measure<R: Runtime>(
   let scale = monitor.scale_factor();
   let current = window_rect(window).ok()?;
 
-  let name = tracked.state();
-  let state = name.as_deref().and_then(|name| config.states.get(name));
+  let state = tracked.resolve(config);
+  let state = state.as_ref();
   let candidates = candidate_slots(config, state, &area, scale, current.size);
 
   Some(Placement {
@@ -517,7 +544,7 @@ fn attach<R: Runtime>(window: Window<R>, shared: Shared) {
   // `windows` block.
   let (initial_state, initial_anchor) = config.initial_for(&label);
   if let Some(state) = initial_state {
-    tracked.set_state(state);
+    tracked.set_state(state, None);
     if let Err(error) = reposition(&window, config, &tracked, initial_anchor, false, &mut None) {
       log::error!("corner-snap: could not place {label}: {error}");
     }
@@ -864,6 +891,22 @@ mod tests {
 
     assert_eq!(slot.anchor, Anchor::Left);
     assert_eq!(slot.rect.size, PhysicalSize::new(90, 320));
+  }
+
+  /// A size passed to `set_state` stands in for the configured one, and the
+  /// next `set_state` without one goes back to it.
+  #[test]
+  fn a_requested_size_holds_until_the_next_set_state() {
+    let config = config(
+      r#"{ "states": { "ask": { "size": [460, 220] } } }"#,
+    );
+    let tracked = Tracked::default();
+
+    tracked.set_state("ask", Some((460.0, 96.0)));
+    assert_eq!(tracked.resolve(&config).unwrap().size, (460.0, 96.0));
+
+    tracked.set_state("ask", None);
+    assert_eq!(tracked.resolve(&config).unwrap().size, (460.0, 220.0));
   }
 
   /// Orientation is what the webview relayouts on, so it has to follow the
