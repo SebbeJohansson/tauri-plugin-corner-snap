@@ -85,6 +85,7 @@ pub use report::{AnchorChanged, Orientation, Placement, ANCHOR_EVENT};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{LogicalSize, Manager, PhysicalPosition, PhysicalSize, Runtime, Window, WindowEvent};
@@ -294,6 +295,19 @@ fn motion_for(followed: bool) -> Motion {
   }
 }
 
+/// How long a move that did not take is left before it is tried again.
+const STUCK_RETRY: Duration = Duration::from_secs(60);
+
+/// A move [`reposition`] asked for, kept to tell whether it took.
+pub(crate) struct Attempt {
+  from: Rect,
+  to: Rect,
+  at: Instant,
+  /// Whether this attempt has already been reported as stuck, so the ticker
+  /// says so once rather than every time it looks.
+  warned: bool,
+}
+
 /// Puts a window where it belongs: the right slot, at the right size.
 ///
 /// The one path for all of it -- the initial placement, `set_state`, `snap`,
@@ -315,9 +329,9 @@ fn motion_for(followed: bool) -> Motion {
 /// [`nearest_to_point`]), the cursor then picks the edge instead of the window
 /// staying put.
 ///
-/// `last_attempt` remembers the (before, after) rectangles of the previous move
-/// so a window that cannot be moved is not chased forever; pass `&mut None` for
-/// a one-off request that should always try.
+/// `last_attempt` remembers the previous move so a window that cannot be moved
+/// is not chased forever; pass `&mut None` for a one-off request that should
+/// always try.
 ///
 /// `Ok(None)` means there was nothing to work from -- no monitor, or the window
 /// is minimized -- as opposed to `Ok(Some(_))`, which is where the window is
@@ -328,7 +342,7 @@ pub(crate) fn reposition<R: Runtime>(
   tracked: &Tracked,
   anchor_override: Option<Anchor>,
   dropped: bool,
-  last_attempt: &mut Option<(Rect, Rect)>,
+  last_attempt: &mut Option<Attempt>,
 ) -> Result<Option<Placement>, String> {
   // A minimized window sits at a sentinel position far off every screen, and
   // `set_position` on it changes only where it will restore to, never what it
@@ -453,15 +467,31 @@ pub(crate) fn reposition<R: Runtime>(
   // the window is somewhere it cannot be moved from. Backstop for anything that
   // pins a window the way minimizing does; without it the retry raises another
   // move event and nothing ever breaks the cycle.
-  if *last_attempt == Some((current, slot.rect)) {
-    log::warn!(
-      "corner-snap: window would not go from {current:?} to {:?}; \
-       leaving it until something else changes",
-      slot.rect
-    );
-    // Still where it is, even though it is not where it was asked to be.
-    tracked.reporter.report(window, placement);
-    return Ok(Some(placement));
+  //
+  // Held off for `STUCK_RETRY`, not for good. A move posted while the displays
+  // are being rearranged -- docking, undocking -- can be dropped without the
+  // window being pinned at all, and the rectangles alone cannot tell the two
+  // apart. Given up on permanently, that one lost move left the widget stranded
+  // where Windows had put it for as long as the app ran. Retrying once a minute
+  // is too slow to be the chase this guard exists to stop.
+  if let Some(attempt) = last_attempt.as_mut() {
+    if attempt.from == current
+      && attempt.to == slot.rect
+      && attempt.at.elapsed() < STUCK_RETRY
+    {
+      if !attempt.warned {
+        attempt.warned = true;
+        log::warn!(
+          "corner-snap: window would not go from {current:?} to {:?}; \
+           trying again in {}s",
+          slot.rect,
+          STUCK_RETRY.as_secs()
+        );
+      }
+      // Still where it is, even though it is not where it was asked to be.
+      tracked.reporter.report(window, placement);
+      return Ok(Some(placement));
+    }
   }
 
   log::debug!(
@@ -475,7 +505,12 @@ pub(crate) fn reposition<R: Runtime>(
     if followed { " (new main screen)" } else { "" },
   );
 
-  *last_attempt = Some((current, slot.rect));
+  *last_attempt = Some(Attempt {
+    from: current,
+    to: slot.rect,
+    at: Instant::now(),
+    warned: false,
+  });
   geometry::move_into(window, current, slot.rect, motion_for(followed))?;
 
   // Announced only once the window is actually there, so a listener that reads
