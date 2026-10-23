@@ -351,8 +351,17 @@ pub(crate) fn reposition<R: Runtime>(
   // full speed, the message loop stops being serviced, and Windows replaces it
   // with a "Not Responding" ghost. Restoring raises its own move event, which
   // is when placement picks up again.
+  //
+  // So the restore is asked for here and the placement left to that event,
+  // rather than placed straight after: the restore is posted, and until it
+  // lands the window still reports the sentinel.
   if window.is_minimized().unwrap_or(false) {
-    log::debug!("corner-snap: window is minimized; leaving it alone");
+    if config.restore_minimized {
+      log::info!("corner-snap: {} was minimized; restoring it", window.label());
+      window.unminimize().map_err(|error| error.to_string())?;
+    } else {
+      log::debug!("corner-snap: window is minimized; leaving it alone");
+    }
     return Ok(None);
   }
 
@@ -1022,6 +1031,15 @@ mod tests {
     assert!(Config::default().follow_primary);
     assert!(config(r#"{ "states": {} }"#).follow_primary);
     assert!(!config(r#"{ "followPrimary": false }"#).follow_primary);
+  }
+
+  /// Restoring is on unless the config says otherwise: a widget with no
+  /// taskbar button has no other way back from being minimized.
+  #[test]
+  fn minimized_windows_are_restored_unless_told_not_to() {
+    assert!(Config::default().restore_minimized);
+    assert!(config(r#"{ "states": {} }"#).restore_minimized);
+    assert!(!config(r#"{ "restoreMinimized": false }"#).restore_minimized);
   }
 
   /// A widget that should hug an edge with no gap at all: the case

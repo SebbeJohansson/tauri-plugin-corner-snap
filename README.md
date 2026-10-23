@@ -221,6 +221,7 @@ quietly doing nothing.
 | `snapDelayMs` | `250` | How long the window must sit still before a drag counts as finished. |
 | `placementCheckMs` | `10000` | Backstop re-check interval. |
 | `followPrimary` | `true` | Carry the window to the main screen when the main screen changes. |
+| `restoreMinimized` | `true` | Restore the window when it is minimized, as Windows does to every window on a monitor that goes away. |
 | `manage` | `"all"` | `"all"`, or `{ "labels": ["main"] }`. |
 | `windows` | `{}` | Per-label overrides of `initialState` and `initialAnchor`. |
 

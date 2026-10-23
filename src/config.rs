@@ -287,6 +287,15 @@ pub struct Config {
   /// are. Turn it off for a window that should sit on whichever screen it was
   /// last put on whatever happens.
   pub follow_primary: bool,
+  /// Whether a minimized window is restored rather than left minimized.
+  ///
+  /// Windows minimizes every window on a monitor that goes away -- unplugged,
+  /// or asleep long enough to drop off -- and expects the owner to bring it
+  /// back from the taskbar. A widget usually has no taskbar button
+  /// (`skipTaskbar`), so nothing can, and it stays gone for as long as the app
+  /// runs. Turn it off for a window that has a taskbar button and should stay
+  /// minimized when asked to.
+  pub restore_minimized: bool,
   /// Which windows to manage.
   pub manage: Manage,
   /// Per-window overrides of the placement settings that apply once, keyed by
@@ -305,6 +314,7 @@ impl Default for Config {
       snap_delay: Duration::from_millis(250),
       placement_check: Duration::from_secs(10),
       follow_primary: true,
+      restore_minimized: true,
       manage: Manage::All,
       windows: HashMap::new(),
     }
